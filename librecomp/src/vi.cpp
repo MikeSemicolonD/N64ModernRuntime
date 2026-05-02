@@ -44,6 +44,10 @@ extern "C" void osViSetMode_recomp(uint8_t* rdram, recomp_context* ctx) {
 
 extern uint64_t total_vis;
 
+extern "C" void osViGetCurrentField_recomp(uint8_t* rdram, recomp_context* ctx) {
+    ctx->r2 = 0; // always field 0 (progressive / non-interlaced)
+}
+
 extern "C" void wait_one_frame(uint8_t* rdram, recomp_context* ctx) {
     uint64_t cur_vis = total_vis;
     while (cur_vis == total_vis) {

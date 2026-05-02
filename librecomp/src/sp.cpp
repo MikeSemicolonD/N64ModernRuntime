@@ -10,12 +10,20 @@ extern "C" void osSpTaskLoad_recomp(uint8_t* rdram, recomp_context* ctx) {
 bool dump_frame = false;
 
 extern "C" void osSpTaskStartGo_recomp(uint8_t* rdram, recomp_context* ctx) {
-    //printf("[sp] osSpTaskStartGo(0x%08X)\n", (uint32_t)ctx->r4);
     OSTask* task = TO_PTR(OSTask, ctx->r4);
-    if (task->t.type == M_GFXTASK) {
-        //printf("[sp] Gfx task: %08X\n", (uint32_t)ctx->r4);
-    } else if (task->t.type == M_AUDTASK) {
-        //printf("[sp] Audio task: %08X\n", (uint32_t)ctx->r4);
+    {
+        static int n = 0;
+        ++n;
+        if (n <= 8 || (n % 60) == 0) {
+            const char* kind = (task->t.type == M_GFXTASK) ? "GFX"
+                             : (task->t.type == M_AUDTASK) ? "AUD" : "OTHER";
+            // ctx->r31 is $ra - the return address of the caller. Tells us which game-side
+            // function called osSpTaskStartGo.
+            fprintf(stderr, "[sp] osSpTaskStartGo #%d kind=%s task=0x%08X data=0x%08X len=%u ra=0x%08X\n",
+                n, kind, (uint32_t)ctx->r4, (uint32_t)task->t.data_ptr,
+                (unsigned)task->t.data_size, (uint32_t)ctx->r31);
+            fflush(stderr);
+        }
     }
     // For debugging
     if (dump_frame) {

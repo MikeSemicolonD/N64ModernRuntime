@@ -59,13 +59,16 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
 
 #if defined(_WIN32)
 void ultramodern::set_native_thread_name(const std::string& name) {
+    printf("[NAME] set_native_thread_name('%s') begin\n", name.c_str()); fflush(stdout);
     std::wstring wname{name.begin(), name.end()};
+    printf("[NAME] wstring constructed ok, len=%zu\n", wname.size()); fflush(stdout);
 
     HRESULT r;
     r = SetThreadDescription(
         GetCurrentThread(),
         wname.c_str()
     );
+    printf("[NAME] SetThreadDescription done (hr=0x%08X)\n", (unsigned)r); fflush(stdout);
 }
 
 void ultramodern::set_native_thread_priority(ThreadPriority pri) {
@@ -147,6 +150,10 @@ void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
 #endif
 
 void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
+    if (thread_context == nullptr) {
+        printf("[CRASH] wait_for_resumed called with NULL context! thread_self=0x%08X\n", (uint32_t)ultramodern::this_thread()); fflush(stdout);
+        std::abort();
+    }
     thread_context->running.wait();
     // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
     // This will trigger thread cleanup instead.
@@ -157,6 +164,10 @@ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
 
 void resume_thread(OSThread* t) {
     debug_printf("[Thread] Resuming execution of thread %d\n", t->id);
+    if (t->context == nullptr) {
+        printf("[CRASH] resume_thread: thread %d has NULL context!\n", t->id); fflush(stdout);
+        std::abort();
+    }
     t->context->running.signal();
 }
 
@@ -167,29 +178,45 @@ void run_next_thread(RDRAM_ARG1) {
 
     OSThread* to_run = TO_PTR(OSThread, ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue));
     debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
+    if (to_run->context == nullptr) {
+        printf("[CRASH] run_next_thread: thread %d has NULL context!\n", to_run->id); fflush(stdout);
+        std::abort();
+    }
     to_run->context->running.signal();
 }
 
 void ultramodern::run_next_thread_and_wait(RDRAM_ARG1) {
     UltraThreadContext* cur_context = TO_PTR(OSThread, thread_self)->context;
+    if (cur_context == nullptr) {
+        printf("[CRASH] run_next_thread_and_wait: cur thread 0x%08X has NULL context!\n", (uint32_t)thread_self); fflush(stdout);
+        std::abort();
+    }
     run_next_thread(PASS_RDRAM1);
     wait_for_resumed(PASS_RDRAM cur_context);
 }
 
 void ultramodern::resume_thread_and_wait(RDRAM_ARG OSThread *t) {
     UltraThreadContext* cur_context = TO_PTR(OSThread, thread_self)->context;
+    if (cur_context == nullptr) {
+        printf("[CRASH] resume_thread_and_wait: cur thread 0x%08X has NULL context!\n", (uint32_t)thread_self); fflush(stdout);
+        std::abort();
+    }
     resume_thread(t);
     wait_for_resumed(PASS_RDRAM cur_context);
 }
 
 static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entrypoint, PTR(void) arg, UltraThreadContext* thread_context) {
     OSThread *self = TO_PTR(OSThread, self_);
+    printf("[Thread] _thread_func: self_=0x%08X self=%p id=%d\n",
+           (uint32_t)self_, (void*)self, self ? self->id : -1); fflush(stdout);
     debug_printf("[Thread] Thread created: %d\n", self->id);
     thread_self = self_;
     is_game_thread = true;
 
     // Set the thread name
-    ultramodern::set_native_thread_name(ultramodern::threads::get_game_thread_name(self));
+    auto _thread_name = ultramodern::threads::get_game_thread_name(self);
+    printf("[Thread] about to set name '%s'\n", _thread_name.c_str()); fflush(stdout);
+    ultramodern::set_native_thread_name(_thread_name);
     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::High);
 
     // Signal the initialized semaphore to indicate that this thread can be started.
@@ -275,7 +302,16 @@ extern "C" void osStopThread(RDRAM_ARG PTR(OSThread) t_) {
         ultramodern::run_next_thread_and_wait(PASS_RDRAM1);
     }
     else {
-        assert(false);
+        // Stopping another thread: remove it from whatever queue it's on and mark
+        // it STOPPED. The host std::thread is already parked inside wait_for_resumed,
+        // so it will stay parked until a later osStartThread signals running again.
+        OSThread* t = TO_PTR(OSThread, t_);
+        if (t->state != OSThreadState::STOPPED) {
+            if (t->queue != NULLPTR) {
+                ultramodern::thread_queue_remove(PASS_RDRAM t->queue, t_);
+            }
+            t->state = OSThreadState::STOPPED;
+        }
     }
 }
 

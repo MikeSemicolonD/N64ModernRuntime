@@ -1,8 +1,13 @@
+#include <cstdio>
 #include "ultramodern/ultramodern.hpp"
 
 #include "helpers.hpp"
 
 #define MAXCONTROLLERS 4
+
+static int g_cont_query_count = 0;
+static int g_cont_read_count = 0;
+static int g_motor_calls = 0;
 
 extern "C" void recomp_set_current_frame_poll_id(uint8_t* rdram, recomp_context* ctx) {
     // TODO reimplement the system for tagging polls with IDs to handle games with multithreaded input polling.
@@ -39,6 +44,9 @@ extern "C" void osContStartReadData_recomp(uint8_t* rdram, recomp_context* ctx) 
 
     s32 ret = osContStartReadData(PASS_RDRAM mq);
 
+    if ((++g_cont_read_count) <= 5 || g_cont_read_count % 50 == 0) {
+        fprintf(stderr, "[trace] osContStartReadData #%d ret=%d\n", g_cont_read_count, (int)ret); fflush(stderr);
+    }
     _return<s32>(ctx, ret);
 }
 
@@ -64,6 +72,9 @@ extern "C" void osContStartQuery_recomp(uint8_t * rdram, recomp_context * ctx) {
 
     s32 ret = osContStartQuery(PASS_RDRAM mq);
 
+    if ((++g_cont_query_count) <= 5 || g_cont_query_count % 50 == 0) {
+        fprintf(stderr, "[trace] osContStartQuery #%d ret=%d\n", g_cont_query_count, (int)ret); fflush(stderr);
+    }
     _return<s32>(ctx, ret);
 }
 
@@ -114,4 +125,12 @@ extern "C" void osMotorStop_recomp(uint8_t* rdram, recomp_context* ctx) {
     s32 ret = osMotorStop(PASS_RDRAM pfs);
 
     _return<s32>(ctx, ret);
+}
+
+extern "C" void __osContRamRead_recomp(uint8_t* rdram, recomp_context* ctx) {
+    _return<s32>(ctx, -1); // no rumble pak
+}
+
+extern "C" void __osContRamWrite_recomp(uint8_t* rdram, recomp_context* ctx) {
+    _return<s32>(ctx, -1); // no rumble pak
 }

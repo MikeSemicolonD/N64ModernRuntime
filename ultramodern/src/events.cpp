@@ -101,7 +101,14 @@ static struct {
             regs.VI_X_SCALE_REG = common_regs->xScale; // TODO implement osViSetXScale
             regs.VI_Y_SCALE_REG = yScale; // TODO implement osViSetYScale
             regs.VI_STATUS_REG = next_state->control;
-            
+
+            { static int n=0; if (++n<=10 || (n%500)==0) {
+                fprintf(stderr, "[trace] update_vi #%d STATUS=0x%X H_START=0x%X WIDTH=0x%X ORIGIN=0x%X state=0x%X modePtr=%p ctrl=0x%X\n",
+                    n, regs.VI_STATUS_REG, regs.VI_H_START_REG, regs.VI_WIDTH_REG, regs.VI_ORIGIN_REG,
+                    next_state->state, (const void*)next_state->mode, next_state->control);
+                fflush(stderr);
+            } }
+
             // Swap VI states.
             cur_state ^= 1;
             *get_next_state() = *get_cur_state();
@@ -460,6 +467,13 @@ extern "C" void osViSetMode(RDRAM_ARG PTR(OSViMode) mode_) {
     ViState* next_state = events_context.vi.get_next_state();
     next_state->mode = mode;
     next_state->control = next_state->mode->comRegs.ctrl;
+    { static int n=0; if (++n<=10) {
+        fprintf(stderr, "[trace] osViSetMode #%d modePtr=0x%08X ctrl=0x%08X type=0x%X width=0x%X hStart=0x%X\n",
+            n, (uint32_t)mode_, next_state->control,
+            next_state->control & 0x3, mode->comRegs.width,
+            mode->comRegs.hStart);
+        fflush(stderr);
+    } }
 }
 
 #define OS_VI_GAMMA_ON          0x0001
@@ -519,6 +533,7 @@ extern "C" void osViBlack(uint8_t active) {
     } else {
         *state_out &= ~VI_STATE_BLACK;
     }
+    { static int n=0; if (++n<=20) { fprintf(stderr, "[trace] osViBlack #%d active=%u state=0x%X\n", n, (unsigned)active, *state_out); fflush(stderr); } }
 }
 
 extern "C" void osViRepeatLine(uint8_t active) {
@@ -608,6 +623,11 @@ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle wind
         }
         throw std::runtime_error("Failed to initialize the renderer");
     }
+
+    // Seed both VI states with the dummy mode so the VI thread's first update_vi()
+    // has a valid mode pointer even if the game starts before calling osViSetMode.
+    events_context.vi.states[0].mode = &dummy_mode;
+    events_context.vi.states[1].mode = &dummy_mode;
 
     events_context.vi.thread = std::thread{ vi_thread_func };
 }

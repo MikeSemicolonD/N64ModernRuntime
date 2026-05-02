@@ -463,7 +463,7 @@ std::atomic<GameStatus> game_status = GameStatus::None;
 void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t arg) {
     auto find_it = game_roms.find(current_game.value());
     const recomp::GameEntry& game_entry = find_it->second;
-    
+
     recomp_context ctx{};
     ctx.r29 = sp;
     ctx.r4 = arg;
@@ -475,7 +475,20 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
     }
 
     recomp_func_t* func = get_function(addr);
+    printf("[DEBUG] thread 0x%08llX starting\n", (unsigned long long)addr); fflush(stdout);
+#ifdef _WIN32
+    __try {
+        func(rdram, &ctx);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        DWORD code = GetExceptionCode();
+        printf("[CRASH] thread 0x%08llX exception 0x%08lX -- terminating\n", (unsigned long long)addr, code);
+        fflush(stdout);
+        std::exit(1);
+    }
+#else
     func(rdram, &ctx);
+#endif
+    printf("[DEBUG] thread 0x%08llX exited\n", (unsigned long long)addr); fflush(stdout);
 }
 
 void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
@@ -686,14 +699,19 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                 }
 
                 recomp::init_heap(rdram, recomp::mod_rdram_start + mod_ram_used);
+                printf("[DEBUG] init_heap done\n"); fflush(stdout);
 
                 save_type = game_entry.save_type;
+                printf("[DEBUG] calling init_saving\n"); fflush(stdout);
                 ultramodern::init_saving(rdram);
+                printf("[DEBUG] init_saving done\n"); fflush(stdout);
 
                 try {
+                    printf("[DEBUG] calling entrypoint\n"); fflush(stdout);
                     game_entry.entrypoint(rdram, context);
+                    printf("[DEBUG] entrypoint returned\n"); fflush(stdout);
                 } catch (ultramodern::thread_terminated& terminated) {
-
+                    printf("[DEBUG] entrypoint threw thread_terminated\n"); fflush(stdout);
                 }
             }
             return true;

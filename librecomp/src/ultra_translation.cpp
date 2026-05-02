@@ -1,4 +1,6 @@
 #include <memory>
+#include <thread>
+#include <cstdio>
 #include <ultramodern/ultra64.h>
 #include <ultramodern/ultramodern.hpp>
 #include "recomp.h"
@@ -12,12 +14,20 @@ extern "C" void __osInitialize_common_recomp(uint8_t * rdram, recomp_context * c
 }
 
 extern "C" void osCreateThread_recomp(uint8_t* rdram, recomp_context* ctx) {
+    printf("[DEBUG] osCreateThread: t=0x%08X id=%d entry=0x%08X arg=0x%08X sp=0x%08X pri=%d\n",
+        (uint32_t)ctx->r4, (int)ctx->r5, (uint32_t)ctx->r6, (uint32_t)ctx->r7,
+        (uint32_t)MEM_W(0x10, ctx->r29), (int)MEM_W(0x14, ctx->r29)); fflush(stdout);
     osCreateThread(rdram, (int32_t)ctx->r4, (OSId)ctx->r5, (int32_t)ctx->r6, (int32_t)ctx->r7,
         (int32_t)MEM_W(0x10, ctx->r29), (OSPri)MEM_W(0x14, ctx->r29));
+    printf("[DEBUG] osCreateThread done\n"); fflush(stdout);
 }
 
 extern "C" void osStartThread_recomp(uint8_t* rdram, recomp_context* ctx) {
+    OSThread* t = TO_PTR(OSThread, (int32_t)ctx->r4);
+    printf("[DEBUG] osStartThread: t=0x%08X id=%d pri=%d state=0x%04X\n",
+        (uint32_t)ctx->r4, (int)t->id, (int)t->priority, (unsigned)t->state); fflush(stdout);
     osStartThread(rdram, (int32_t)ctx->r4);
+    printf("[DEBUG] osStartThread done (id=%d)\n", (int)t->id); fflush(stdout);
 }
 
 extern "C" void osStopThread_recomp(uint8_t * rdram, recomp_context * ctx) {
@@ -29,8 +39,10 @@ extern "C" void osDestroyThread_recomp(uint8_t * rdram, recomp_context * ctx) {
 }
 
 extern "C" void osYieldThread_recomp(uint8_t * rdram, recomp_context * ctx) {
-    assert(false);
-    // osYieldThread(rdram);
+    // TODO: proper cooperative yield. ultramodern::check_running_queue(rdram)
+    // crashed (null deref) at frame ~25. std::this_thread::yield() is a host-OS
+    // yield, not a recomp thread swap, but at least it's stable.
+    std::this_thread::yield();
 }
 
 extern "C" void osSetThreadPri_recomp(uint8_t* rdram, recomp_context* ctx) {
