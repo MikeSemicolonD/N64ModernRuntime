@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _MSC_VER
@@ -371,11 +372,32 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
     if (func_find == func_map.end()) {
 #ifdef _MSC_VER
         void *ra = _ReturnAddress();
-        fprintf(stderr, "Failed to find function at 0x%08X (caller host RA=%p)\n", addr, ra);
+        // The recomp doesn't update ctx->r31 at JAL sites, so functions that
+        // tail-return via `jr $t9` (where $t9 was set to $ra at entry) read
+        // stale $ra (often 0), emit LOOKUP_FUNC(0), and hit this stub. Those
+        // calls are benign — the host C return unwinds correctly. Log only
+        // the first occurrence per unique caller MIPS function so the log
+        // stays useful.
+        static std::unordered_set<int32_t> seenCallerMips;
+        uintptr_t raAddr = (uintptr_t)ra;
+        int32_t bestMips = 0;
+        uintptr_t bestHost = 0;
+        for (const auto &kv : func_map) {
+            uintptr_t hostAddr = (uintptr_t)kv.second;
+            if (hostAddr <= raAddr && hostAddr > bestHost) {
+                bestHost = hostAddr;
+                bestMips = kv.first;
+            }
+        }
+        if (seenCallerMips.insert(bestMips).second) {
+            fprintf(stderr, "[null-call] addr=0x%08X from MIPS func ~ 0x%08X (ra-base=0x%X) — likely $ra-leak tail-return, benign\n",
+                addr, bestMips, (unsigned)(raAddr - bestHost));
+            fflush(stderr);
+        }
 #else
         fprintf(stderr, "Failed to find function at 0x%08X\n", addr);
-#endif
         fflush(stderr);
+#endif
         // Return a stub that does nothing so the run continues and we can
         // see what state follows. This is debug-only; remove once the
         // missing function is identified.
