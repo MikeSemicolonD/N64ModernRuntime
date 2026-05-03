@@ -5,6 +5,11 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#pragma intrinsic(_ReturnAddress)
+#endif
+
 #include "ultramodern/ultramodern.hpp"
 
 #include "recomp.h"
@@ -364,9 +369,24 @@ recomp_func_t* recomp::overlays::get_func_by_section_rom_function_vram(uint32_t 
 extern "C" recomp_func_t * get_function(int32_t addr) {
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {
+#ifdef _MSC_VER
+        void *ra = _ReturnAddress();
+        fprintf(stderr, "Failed to find function at 0x%08X (caller host RA=%p)\n", addr, ra);
+#else
         fprintf(stderr, "Failed to find function at 0x%08X\n", addr);
-        assert(false);
-        std::exit(EXIT_FAILURE);
+#endif
+        fflush(stderr);
+        // Return a stub that does nothing so the run continues and we can
+        // see what state follows. This is debug-only; remove once the
+        // missing function is identified.
+        static recomp_func_t *stub = +[](uint8_t* /*rdram*/, recomp_context* /*ctx*/) {
+            static int n = 0;
+            if (++n <= 20) {
+                fprintf(stderr, "[trace] get_function NULL stub invoked #%d\n", n);
+                fflush(stderr);
+            }
+        };
+        return stub;
     }
     return func_find->second;
 }

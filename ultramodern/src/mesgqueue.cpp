@@ -16,6 +16,7 @@ namespace mqdiag {
     static const char *kSrcName[kNumSrc] = { "Tmr", "Sp", "Si", "Ai", "Vi", "Pi", "Dp", "Unt" };
     struct Counts {
         std::atomic<uint64_t> sends{0}, recvs{0}, external{0}, delivered{0}, drop_blocked{0};
+        std::atomic<uint64_t> blocked_lost{0}, blocked_requeued{0};
         std::atomic<uint64_t> ext_by_src[kNumSrc]{};
     };
     static std::unordered_map<uint32_t, Counts> counts;
@@ -37,21 +38,25 @@ namespace mqdiag {
     }
     static void bump_delivered(uint32_t mq)  { get(mq).delivered.fetch_add(1, std::memory_order_relaxed); }
     static void bump_blocked(uint32_t mq)    { get(mq).drop_blocked.fetch_add(1, std::memory_order_relaxed); }
+    static void bump_blocked_lost(uint32_t mq)     { get(mq).blocked_lost.fetch_add(1, std::memory_order_relaxed); }
+    static void bump_blocked_requeued(uint32_t mq) { get(mq).blocked_requeued.fetch_add(1, std::memory_order_relaxed); }
 }
 
 extern "C" void mqdiag_dump(const char *path) {
     FILE *fp = fopen(path, "w");
     if (!fp) return;
     std::lock_guard<std::mutex> g(mqdiag::counts_mu);
-    fprintf(fp, "# mq_addr     sends  recvs  ext  deliv  blk  Tmr  Sp  Si  Ai  Vi  Pi  Dp  Unt\n");
+    fprintf(fp, "# mq_addr     sends  recvs  ext  deliv  blk  lost  rq   Tmr  Sp  Si  Ai  Vi  Pi  Dp  Unt\n");
     for (auto &kv : mqdiag::counts) {
-        fprintf(fp, "0x%08X  %5llu  %5llu  %3llu  %5llu  %3llu",
+        fprintf(fp, "0x%08X  %5llu  %5llu  %3llu  %5llu  %3llu  %4llu  %4llu",
                 kv.first,
                 (unsigned long long)kv.second.sends.load(),
                 (unsigned long long)kv.second.recvs.load(),
                 (unsigned long long)kv.second.external.load(),
                 (unsigned long long)kv.second.delivered.load(),
-                (unsigned long long)kv.second.drop_blocked.load());
+                (unsigned long long)kv.second.drop_blocked.load(),
+                (unsigned long long)kv.second.blocked_lost.load(),
+                (unsigned long long)kv.second.blocked_requeued.load());
         for (int i = 0; i < mqdiag::kNumSrc; ++i) {
             fprintf(fp, "  %3llu", (unsigned long long)kv.second.ext_by_src[i].load());
         }
@@ -96,19 +101,35 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
 void dequeue_external_messages(RDRAM_ARG1) {
     QueuedMessage to_send;
     std::vector<QueuedMessage> requeued_messages{};
+    uint32_t pass_drained = 0, pass_delivered = 0, pass_lost = 0, pass_requeued = 0;
     while (external_messages.try_dequeue(to_send)) {
+        ++pass_drained;
         bool ok = do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
         if (ok) {
             mqdiag::bump_delivered(static_cast<uint32_t>(to_send.mq));
+            ++pass_delivered;
         } else {
             mqdiag::bump_blocked(static_cast<uint32_t>(to_send.mq));
             if (to_send.requeue_if_blocked) {
                 requeued_messages.push_back(to_send);
+                mqdiag::bump_blocked_requeued(static_cast<uint32_t>(to_send.mq));
+                ++pass_requeued;
+            } else {
+                mqdiag::bump_blocked_lost(static_cast<uint32_t>(to_send.mq));
+                ++pass_lost;
             }
         }
     }
     for (QueuedMessage& cur_mesg : requeued_messages) {
         external_messages.enqueue(cur_mesg);
+    }
+    if (pass_drained > 1 || pass_lost > 0) {
+        static int n = 0;
+        if (++n <= 200) {
+            fprintf(stderr, "[mqdrain #%d] drained=%u deliv=%u lost=%u rq=%u\n",
+                    n, pass_drained, pass_delivered, pass_lost, pass_requeued);
+            fflush(stderr);
+        }
     }
 }
 
@@ -151,7 +172,7 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
     return MQ_GET_COUNT(mq) >= mq->msgCount;
 }
 
-static bool is_focus_mq(uint32_t mq) { return mq == 0x80114388 || mq == 0x8011A408; }
+static bool is_focus_mq(uint32_t mq) { return mq == 0x80114388 || mq == 0x8011A408 || mq == 0x8011A7E8; }
 static FILE *mqfocus_fp = nullptr;
 static std::mutex mqfocus_mu;
 static void mqfocus_log(const char *tag, uint32_t mq, OSMesgQueue *q, bool block, int outcome) {

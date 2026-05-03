@@ -45,6 +45,11 @@ struct ViState {
     uint32_t state;
     uint32_t control;
     int retrace_count = 1;
+    // Local deep-copy of the game's mode struct. The game (Factor5/Rogue Squadron)
+    // sometimes places its OSViMode on a stack frame or scratch heap that gets
+    // reused, zeroing the RDRAM contents under our pointer. Copy into local
+    // storage and re-anchor `mode` to it inside osViSetMode.
+    OSViMode mode_storage;
 };
 
 #define VI_STATE_BLACK 0x20
@@ -172,6 +177,9 @@ extern "C" void osViSetEvent(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, u32 ret
     next_state->mq = mq_;
     next_state->msg = msg;
     next_state->retrace_count = retrace_count;
+    fprintf(stderr, "[trace] osViSetEvent mq=0x%08X msg=0x%016llX rc=%u\n",
+        (uint32_t)mq_, (unsigned long long)(uintptr_t)msg, (unsigned)retrace_count);
+    fflush(stderr);
 }
 
 uint64_t total_vis = 0;
@@ -229,6 +237,20 @@ void vi_thread_func() {
 
         // Update VI registers and swap VI modes.
         events_context.vi.update_vi();
+        // Watch counter_E byte at MIPS 0x80128EAE (host index 0x128EAD due to byte-swap within word).
+        { static uint8_t prev_cE = 0xFF; static uint8_t prev_cF = 0xFF;
+            if (events_context.rdram) {
+                uint8_t cE = *(uint8_t*)(events_context.rdram + 0x128EADu);
+                uint8_t cF = *(uint8_t*)(events_context.rdram + 0x128EACu);
+                if (cE != prev_cE || cF != prev_cF) {
+                    fprintf(stderr, "[trace] counter-watch: E=%u F=%u (was E=%u F=%u)\n",
+                        (unsigned)cE, (unsigned)cF, (unsigned)prev_cE, (unsigned)prev_cF);
+                    fflush(stderr);
+                    prev_cE = cE;
+                    prev_cF = cF;
+                }
+            }
+        }
 
         // If the game has started, handle sending VI and AI events.
         if (ultramodern::is_game_started()) {
@@ -239,8 +261,19 @@ void vi_thread_func() {
             if (remaining_retraces == 0) {
                 if (cur_state->mq != NULLPTR) {
                     // Send a message to the VI queue, and do not set it to be requeued if the queue was full.
-                    // The worst case scenario is that the game misses a VI message and has to wait a little longer for the next. 
+                    // The worst case scenario is that the game misses a VI message and has to wait a little longer for the next.
                     ultramodern::enqueue_external_message_src(cur_state->mq, cur_state->msg, false, ultramodern::EventMessageSource::Vi);
+                    { static int n=0; if (++n<=10 || (n%500)==0) {
+                        fprintf(stderr, "[trace] VI->retrace_enqueue #%d mq=0x%08X msg=0x%016llX\n",
+                            n, (uint32_t)cur_state->mq, (unsigned long long)(uintptr_t)cur_state->msg);
+                        fflush(stderr);
+                    } }
+                } else {
+                    static int nullq_count = 0;
+                    if (++nullq_count <= 5 || (nullq_count % 500) == 0) {
+                        fprintf(stderr, "[trace] VI->retrace_enqueue NULL mq #%d\n", nullq_count);
+                        fflush(stderr);
+                    }
                 }
                 remaining_retraces = cur_state->retrace_count;
             }
@@ -458,20 +491,31 @@ void set_dummy_vi(bool odd) {
 
 extern "C" void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr) {
     std::lock_guard lock{ events_context.message_mutex };
-    events_context.vi.get_next_state()->framebuffer = frameBufPtr;
+    ViState* next_state = events_context.vi.get_next_state();
+    next_state->framebuffer = frameBufPtr;
+    // Rogue Squadron / Factor5 calls osViBlack(1) at boot but never osViBlack(0).
+    // Submitting a real framebuffer for swap implies the game wants the display
+    // unblanked, so auto-clear the BLACK flag here.
+    next_state->state &= ~VI_STATE_BLACK;
+    { static int n=0; if (++n<=10 || (n%50)==0) {
+        fprintf(stderr, "[trace] osViSwapBuffer #%d fb=0x%08X state-after=0x%X\n",
+            n, (uint32_t)frameBufPtr, next_state->state);
+        fflush(stderr);
+    } }
 }
 
 extern "C" void osViSetMode(RDRAM_ARG PTR(OSViMode) mode_) {
     std::lock_guard lock{ events_context.message_mutex };
     OSViMode* mode = TO_PTR(OSViMode, mode_);
     ViState* next_state = events_context.vi.get_next_state();
-    next_state->mode = mode;
+    next_state->mode_storage = *mode;
+    next_state->mode = &next_state->mode_storage;
     next_state->control = next_state->mode->comRegs.ctrl;
     { static int n=0; if (++n<=10) {
-        fprintf(stderr, "[trace] osViSetMode #%d modePtr=0x%08X ctrl=0x%08X type=0x%X width=0x%X hStart=0x%X\n",
+        fprintf(stderr, "[trace] osViSetMode #%d modePtr=0x%08X ctrl=0x%08X type=0x%X width=0x%X hStart=0x%X (deep-copied)\n",
             n, (uint32_t)mode_, next_state->control,
-            next_state->control & 0x3, mode->comRegs.width,
-            mode->comRegs.hStart);
+            next_state->control & 0x3, next_state->mode->comRegs.width,
+            next_state->mode->comRegs.hStart);
         fflush(stderr);
     } }
 }
@@ -569,6 +613,18 @@ extern "C" PTR(void) osViGetCurrentFramebuffer() {
 
 void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     OSTask* task = TO_PTR(OSTask, task_);
+
+    {
+        static int n_gfx = 0, n_other = 0;
+        bool is_gfx = (task->t.type == M_GFXTASK);
+        if (is_gfx) ++n_gfx; else ++n_other;
+        if ((is_gfx && (n_gfx <= 50 || (n_gfx % 25) == 0)) ||
+            (!is_gfx && (n_other <= 5 || (n_other % 50) == 0))) {
+            fprintf(stderr, "[trace] submit_rsp_task type=%u (n_gfx=%d n_other=%d)\n",
+                (unsigned)task->t.type, n_gfx, n_other);
+            fflush(stderr);
+        }
+    }
 
     // Send gfx tasks to the graphics action queue
     if (task->t.type == M_GFXTASK) {

@@ -237,6 +237,14 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
             // Run the thread's function with the provided argument.
             run_thread_function(PASS_RDRAM entrypoint, self->sp, arg);
         } catch (ultramodern::thread_terminated& terminated) {
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[Thread] EXCEPTION on thread id=%d entry=0x%08X: %s\n",
+                self->id, (uint32_t)entrypoint, e.what());
+            fflush(stderr);
+        } catch (...) {
+            fprintf(stderr, "[Thread] UNKNOWN EXCEPTION on thread id=%d entry=0x%08X\n",
+                self->id, (uint32_t)entrypoint);
+            fflush(stderr);
         }
     }
     else {

@@ -477,9 +477,17 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
     recomp_func_t* func = get_function(addr);
     printf("[DEBUG] thread 0x%08llX starting\n", (unsigned long long)addr); fflush(stdout);
 #ifdef _WIN32
+    // Filter: let C++ exceptions (0xE06D7363) propagate so the outer C++
+    // try/catch in threads.cpp can capture e.what(). Only catch genuine
+    // hardware/SEH exceptions (access violations, illegal instructions, etc.)
+    // here since C++ runtime can't unwind those.
+    auto seh_filter = [](DWORD code) -> int {
+        if (code == 0xE06D7363) return EXCEPTION_CONTINUE_SEARCH; // C++ exception — let it propagate
+        return EXCEPTION_EXECUTE_HANDLER;
+    };
     __try {
         func(rdram, &ctx);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
+    } __except(seh_filter(GetExceptionCode())) {
         DWORD code = GetExceptionCode();
         printf("[CRASH] thread 0x%08llX exception 0x%08lX -- terminating\n", (unsigned long long)addr, code);
         fflush(stdout);
