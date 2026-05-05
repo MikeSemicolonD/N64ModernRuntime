@@ -477,21 +477,22 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
     recomp_func_t* func = get_function(addr);
     printf("[DEBUG] thread 0x%08llX starting\n", (unsigned long long)addr); fflush(stdout);
 #ifdef _WIN32
-    // Filter: let C++ exceptions (0xE06D7363) propagate so the outer C++
-    // try/catch in threads.cpp can capture e.what(). Only catch genuine
-    // hardware/SEH exceptions (access violations, illegal instructions, etc.)
-    // here since C++ runtime can't unwind those.
-    auto seh_filter = [](DWORD code) -> int {
-        if (code == 0xE06D7363) return EXCEPTION_CONTINUE_SEARCH; // C++ exception — let it propagate
-        return EXCEPTION_EXECUTE_HANDLER;
-    };
+    // Let C++ exceptions (0xE06D7363) propagate so the outer try/catch in
+    // threads.cpp can capture e.what(). Hardware SEH exceptions (AVs etc.)
+    // also propagate — main.cpp's SetUnhandledExceptionFilter writes a
+    // minidump and a symbolicated stack before the OS terminates the process.
+    // (Earlier code caught hardware exceptions here and called std::exit(1),
+    // which both lost the dump and triggered std::terminate via the
+    // thread_cleaner_thread static destructor.)
     __try {
         func(rdram, &ctx);
-    } __except(seh_filter(GetExceptionCode())) {
-        DWORD code = GetExceptionCode();
-        printf("[CRASH] thread 0x%08llX exception 0x%08lX -- terminating\n", (unsigned long long)addr, code);
-        fflush(stdout);
-        std::exit(1);
+    } __except(GetExceptionCode() == 0xE06D7363
+               ? EXCEPTION_CONTINUE_SEARCH
+               : (printf("[CRASH] thread 0x%08llX exception 0x%08lX\n",
+                         (unsigned long long)addr, GetExceptionCode()),
+                  fflush(stdout),
+                  EXCEPTION_CONTINUE_SEARCH)) {
+        // Unreachable — both paths return EXCEPTION_CONTINUE_SEARCH.
     }
 #else
     func(rdram, &ctx);
