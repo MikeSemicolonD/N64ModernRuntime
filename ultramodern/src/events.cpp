@@ -35,7 +35,19 @@ struct ScreenUpdateAction {
 struct UpdateConfigAction {
 };
 
-using Action = std::variant<SpTaskAction, ScreenUpdateAction, UpdateConfigAction>;
+struct RdpRangeAction {
+    uint32_t lo_phys;
+    uint32_t hi_phys;
+};
+
+// Batched RDP-range submissions. Factor5's LLE recompile emits ~1M tiny
+// ranges/sec; per-range enqueues flood the action_queue. The bridge
+// accumulates ~512 ranges then enqueues them all as one batch action.
+struct RdpRangeBatchAction {
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+};
+
+using Action = std::variant<SpTaskAction, ScreenUpdateAction, UpdateConfigAction, RdpRangeAction, RdpRangeBatchAction>;
 
 struct ViState {
     const OSViMode* mode;
@@ -107,10 +119,10 @@ static struct {
             regs.VI_Y_SCALE_REG = yScale; // TODO implement osViSetYScale
             regs.VI_STATUS_REG = next_state->control;
 
-            { static int n=0; if (++n<=10 || (n%500)==0) {
-                fprintf(stderr, "[trace] update_vi #%d STATUS=0x%X H_START=0x%X WIDTH=0x%X ORIGIN=0x%X state=0x%X modePtr=%p ctrl=0x%X\n",
+            { static int n=0; if (++n<=10 || (n%60)==0) {
+                if(false) fprintf(stderr, "[trace] update_vi #%d STATUS=0x%X H_START=0x%X WIDTH=0x%X ORIGIN=0x%X state=0x%X ctrl=0x%X\n",
                     n, regs.VI_STATUS_REG, regs.VI_H_START_REG, regs.VI_WIDTH_REG, regs.VI_ORIGIN_REG,
-                    next_state->state, (const void*)next_state->mode, next_state->control);
+                    next_state->state, next_state->control);
                 fflush(stderr);
             } }
 
@@ -177,7 +189,7 @@ extern "C" void osViSetEvent(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, u32 ret
     next_state->mq = mq_;
     next_state->msg = msg;
     next_state->retrace_count = retrace_count;
-    fprintf(stderr, "[trace] osViSetEvent mq=0x%08X msg=0x%016llX rc=%u\n",
+    if(false) fprintf(stderr, "[trace] osViSetEvent mq=0x%08X msg=0x%016llX rc=%u\n",
         (uint32_t)mq_, (unsigned long long)(uintptr_t)msg, (unsigned)retrace_count);
     fflush(stderr);
 }
@@ -237,13 +249,28 @@ void vi_thread_func() {
 
         // Update VI registers and swap VI modes.
         events_context.vi.update_vi();
+
+        // DIAG-3: read first 4 bytes at VI ORIGIN to distinguish black/white/content
+        // framebuffers. If fb_first == 0x00010001, the VI is pointing at a
+        // properly-cleared-black RGBA-5551 framebuffer. If 0xFFFFFFFF, white.
+        // If something else, we're presenting actual content.
+        { static int n=0; if (++n<=10 || (n%60)==0) {
+            uint32_t orig_phys = events_context.vi.regs.VI_ORIGIN_REG & 0x00FFFFFF;
+            uint32_t fb_first = 0;
+            if (events_context.rdram && orig_phys < 0x800000 - 4) {
+                fb_first = *(uint32_t*)(events_context.rdram + orig_phys);
+            }
+            if(false) fprintf(stderr, "[diag-vi] #%d ORIGIN=0x%X fb_first=0x%08X\n",
+                n, events_context.vi.regs.VI_ORIGIN_REG, fb_first);
+            fflush(stderr);
+        } }
         // Watch counter_E byte at MIPS 0x80128EAE (host index 0x128EAD due to byte-swap within word).
         { static uint8_t prev_cE = 0xFF; static uint8_t prev_cF = 0xFF;
             if (events_context.rdram) {
                 uint8_t cE = *(uint8_t*)(events_context.rdram + 0x128EADu);
                 uint8_t cF = *(uint8_t*)(events_context.rdram + 0x128EACu);
                 if (cE != prev_cE || cF != prev_cF) {
-                    fprintf(stderr, "[trace] counter-watch: E=%u F=%u (was E=%u F=%u)\n",
+                    if(false) fprintf(stderr, "[trace] counter-watch: E=%u F=%u (was E=%u F=%u)\n",
                         (unsigned)cE, (unsigned)cF, (unsigned)prev_cE, (unsigned)prev_cF);
                     fflush(stderr);
                     prev_cE = cE;
@@ -264,14 +291,14 @@ void vi_thread_func() {
                     // The worst case scenario is that the game misses a VI message and has to wait a little longer for the next.
                     ultramodern::enqueue_external_message_src(cur_state->mq, cur_state->msg, false, ultramodern::EventMessageSource::Vi);
                     { static int n=0; if (++n<=10 || (n%500)==0) {
-                        fprintf(stderr, "[trace] VI->retrace_enqueue #%d mq=0x%08X msg=0x%016llX\n",
+                        if(false) fprintf(stderr, "[trace] VI->retrace_enqueue #%d mq=0x%08X msg=0x%016llX\n",
                             n, (uint32_t)cur_state->mq, (unsigned long long)(uintptr_t)cur_state->msg);
                         fflush(stderr);
                     } }
                 } else {
                     static int nullq_count = 0;
                     if (++nullq_count <= 5 || (nullq_count % 500) == 0) {
-                        fprintf(stderr, "[trace] VI->retrace_enqueue NULL mq #%d\n", nullq_count);
+                        if(false) fprintf(stderr, "[trace] VI->retrace_enqueue NULL mq #%d\n", nullq_count);
                         fflush(stderr);
                     }
                 }
@@ -324,6 +351,10 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
 
         // Tell the game that the RSP has completed
         sp_complete();
+
+        // dp_complete is fired by the HLE arm in gfx_thread for GFX tasks
+        // (after send_dl returns), giving the game's frame state machine the
+        // expected timing. We don't fire it from here.
     }
 }
 
@@ -408,8 +439,14 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 PTR(u64) displaylist = task_action->task.t.data_ptr;
                 ultramodern::extensions::on_displaylist_submitted(displaylist);
 
+                // HLE rendering (send_dl) is suppressed for Rogue Squadron — the game
+                // uses Factor5 ucode, which we drive via the LLE recompile + dpc_bridge.
+                // Running HLE in parallel races with LLE (flicker) and floods the
+                // gfx_thread, starving the Win32 message pump (Not Responding).
+                // We keep sp_complete/dp_complete so the game's frame state machine
+                // still advances on the expected schedule.
                 [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
-                renderer_context->send_dl(&task_action->task);
+                // renderer_context->send_dl(&task_action->task);
                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
 
                 dp_complete();
@@ -429,6 +466,14 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 auto new_config = ultramodern::renderer::get_graphics_config();
                 if (renderer_context->update_config(old_config, new_config)) {
                     old_config = new_config;
+                }
+            }
+            else if (const auto* rdp_action = std::get_if<RdpRangeAction>(&action)) {
+                renderer_context->send_rdp_range(rdp_action->lo_phys, rdp_action->hi_phys);
+            }
+            else if (const auto* rdp_batch = std::get_if<RdpRangeBatchAction>(&action)) {
+                for (const auto& r : rdp_batch->ranges) {
+                    renderer_context->send_rdp_range(r.first, r.second);
                 }
             }
         }
@@ -497,11 +542,20 @@ extern "C" void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr) {
     // Submitting a real framebuffer for swap implies the game wants the display
     // unblanked, so auto-clear the BLACK flag here.
     next_state->state &= ~VI_STATE_BLACK;
-    { static int n=0; if (++n<=10 || (n%50)==0) {
-        fprintf(stderr, "[trace] osViSwapBuffer #%d fb=0x%08X state-after=0x%X\n",
-            n, (uint32_t)frameBufPtr, next_state->state);
-        fflush(stderr);
-    } }
+    { static int n=0;
+      static uint32_t seen[16] = {0};
+      static int n_seen = 0;
+      ++n;
+      uint32_t fb = (uint32_t)frameBufPtr;
+      bool is_new = true;
+      for (int k = 0; k < n_seen; ++k) if (seen[k] == fb) { is_new = false; break; }
+      if (is_new && n_seen < 16) seen[n_seen++] = fb;
+      if (n<=10 || (n%50)==0 || is_new) {
+          if(false) fprintf(stderr, "[trace] osViSwapBuffer #%d fb=0x%08X state-after=0x%X%s\n",
+              n, fb, next_state->state, is_new ? "  *** NEW ***" : "");
+          fflush(stderr);
+      }
+    }
 }
 
 extern "C" void osViSetMode(RDRAM_ARG PTR(OSViMode) mode_) {
@@ -512,7 +566,7 @@ extern "C" void osViSetMode(RDRAM_ARG PTR(OSViMode) mode_) {
     next_state->mode = &next_state->mode_storage;
     next_state->control = next_state->mode->comRegs.ctrl;
     { static int n=0; if (++n<=10) {
-        fprintf(stderr, "[trace] osViSetMode #%d modePtr=0x%08X ctrl=0x%08X type=0x%X width=0x%X hStart=0x%X (deep-copied)\n",
+        if(false) fprintf(stderr, "[trace] osViSetMode #%d modePtr=0x%08X ctrl=0x%08X type=0x%X width=0x%X hStart=0x%X (deep-copied)\n",
             n, (uint32_t)mode_, next_state->control,
             next_state->control & 0x3, next_state->mode->comRegs.width,
             next_state->mode->comRegs.hStart);
@@ -577,7 +631,7 @@ extern "C" void osViBlack(uint8_t active) {
     } else {
         *state_out &= ~VI_STATE_BLACK;
     }
-    { static int n=0; if (++n<=20) { fprintf(stderr, "[trace] osViBlack #%d active=%u state=0x%X\n", n, (unsigned)active, *state_out); fflush(stderr); } }
+    { static int n=0; if (++n<=20) { if(false) fprintf(stderr, "[trace] osViBlack #%d active=%u state=0x%X\n", n, (unsigned)active, *state_out); fflush(stderr); } }
 }
 
 extern "C" void osViRepeatLine(uint8_t active) {
@@ -620,19 +674,35 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
         if (is_gfx) ++n_gfx; else ++n_other;
         if ((is_gfx && (n_gfx <= 50 || (n_gfx % 25) == 0)) ||
             (!is_gfx && (n_other <= 5 || (n_other % 50) == 0))) {
-            fprintf(stderr, "[trace] submit_rsp_task type=%u (n_gfx=%d n_other=%d)\n",
+            if(false) fprintf(stderr, "[trace] submit_rsp_task type=%u (n_gfx=%d n_other=%d)\n",
                 (unsigned)task->t.type, n_gfx, n_other);
             fflush(stderr);
         }
     }
 
-    // Send gfx tasks to the graphics action queue
+    // GFX tasks: dual-route. HLE arm drives the game-thread signaling
+    // (sp_complete/dp_complete from gfx_thread, matching the timing the
+    // game's frame state machine expects). LLE runs in parallel for the
+    // actual visuals (Factor5 ucode renders the title 3D content correctly).
+    // The PIPESYNC filter in dpc_bridge keeps queue volume manageable.
     if (task->t.type == M_GFXTASK) {
         events_context.action_queue.enqueue(SpTaskAction{ *task });
+        events_context.sp_task_queue.enqueue(task);
     }
-    // Set all other tasks as the RSP task
     else {
         events_context.sp_task_queue.enqueue(task);
+    }
+}
+
+void ultramodern::submit_rdp_range(uint32_t lo_phys, uint32_t hi_phys) {
+    if (hi_phys > lo_phys) {
+        events_context.action_queue.enqueue(RdpRangeAction{ lo_phys, hi_phys });
+    }
+}
+
+void ultramodern::submit_rdp_range_batch(std::vector<std::pair<uint32_t, uint32_t>>&& ranges) {
+    if (!ranges.empty()) {
+        events_context.action_queue.enqueue(RdpRangeBatchAction{ std::move(ranges) });
     }
 }
 

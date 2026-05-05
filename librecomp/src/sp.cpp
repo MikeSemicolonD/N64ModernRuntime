@@ -19,7 +19,7 @@ extern "C" void osSpTaskStartGo_recomp(uint8_t* rdram, recomp_context* ctx) {
                              : (task->t.type == M_AUDTASK) ? "AUD" : "OTHER";
             // ctx->r31 is $ra - the return address of the caller. Tells us which game-side
             // function called osSpTaskStartGo.
-            fprintf(stderr, "[sp] osSpTaskStartGo #%d kind=%s task=0x%08X data=0x%08X len=%u ra=0x%08X\n",
+            if(false) fprintf(stderr, "[sp] osSpTaskStartGo #%d kind=%s task=0x%08X data=0x%08X len=%u ra=0x%08X\n",
                 n, kind, (uint32_t)ctx->r4, (uint32_t)task->t.data_ptr,
                 (unsigned)task->t.data_size, (uint32_t)ctx->r31);
             fflush(stderr);

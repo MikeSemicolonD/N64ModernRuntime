@@ -84,6 +84,9 @@ namespace ultramodern {
 
                 virtual void enable_instant_present() = 0;
                 virtual void send_dl(const OSTask* task) = 0;
+                // Forward [lo_phys, hi_phys) RDRAM bytes as raw RDP commands.
+                // Default no-op so renderers without LLE support compile.
+                virtual void send_rdp_range(uint32_t /*lo_phys*/, uint32_t /*hi_phys*/) {}
                 virtual void update_screen() = 0;
                 virtual void shutdown() = 0;
                 virtual uint32_t get_display_framerate() const = 0;

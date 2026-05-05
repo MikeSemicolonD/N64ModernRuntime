@@ -70,12 +70,12 @@ extern "C" void osSendMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
     // Log every send to the frame-thread's recv2 queue at 0x80128D10. Rate-limit
     // others so we can see who's sending what.
     if (mq == 0x80128D10) {
-        fprintf(stderr, "[trace] osSendMesg->0x80128D10 msg=0x%016llX flags=%d\n",
+        if(false) fprintf(stderr, "[trace] osSendMesg->0x80128D10 msg=0x%016llX flags=%d\n",
             (unsigned long long)(uintptr_t)ctx->r5, (int)(int32_t)ctx->r6);
         fflush(stderr);
     } else {
         static int n=0; if (++n<=20 || (n%500)==0) {
-            fprintf(stderr, "[trace] osSendMesg #%d mq=0x%08X msg=0x%016llX\n",
+            if(false) fprintf(stderr, "[trace] osSendMesg #%d mq=0x%08X msg=0x%016llX\n",
                 n, mq, (unsigned long long)(uintptr_t)ctx->r5);
             fflush(stderr);
         }

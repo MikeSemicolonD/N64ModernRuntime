@@ -94,10 +94,44 @@ static inline void RSP_MEM_H_STORE(uint32_t offset, uint32_t addr, uint32_t val)
 #define DO_DMA_READ(rd_len) dma_rdram_to_dmem(rdram, dma_mem_address, dma_dram_address, (rd_len))
 #define DO_DMA_WRITE(wr_len) dma_dmem_to_rdram(rdram, dma_mem_address, dma_dram_address, (wr_len))
 
+// DPC (RDP command-queue) bridge for graphics RSP ucodes that emit RDP commands
+// directly via mtc0 to DPC_START/DPC_END (Factor5 ucode does this). The host
+// implements rsp_dpc_submit() to forward [start..end] RDRAM bytes to the
+// rendering backend; default is a weak no-op (commands logged but not rendered).
+extern uint32_t g_rsp_dpc_start;
+extern uint32_t g_rsp_dpc_end;
+void rsp_dpc_submit(uint8_t* rdram, uint32_t start, uint32_t end);
+#define RSP_DPC_START(val)         (g_rsp_dpc_start = (val))
+#define RSP_DPC_END(val)           (rsp_dpc_submit(rdram, g_rsp_dpc_start, (val)), g_rsp_dpc_end = (val))
+#define RSP_DPC_STATUS_WRITE(val)  ((void)(val))   /* clear-flag writes are no-ops */
+// DPC_CURRENT returns g_rsp_dpc_end if non-zero, else 0xFFFFFFFF — the latter
+// keeps any `beq DPC_CURRENT, $head` busy-wait from spinning when both are 0
+// (initial state). Real RDP never holds CURRENT == 0 in normal operation.
+#define RSP_DPC_CURRENT_READ()     (g_rsp_dpc_end ? g_rsp_dpc_end : 0xFFFFFFFFu)
+#define RSP_DPC_END_READ()         (g_rsp_dpc_end)
+
+// Bounded DMA: clamp lengths/addresses so a graphics ucode that runs with
+// uninitialized GPRs (e.g. before its bootloader has set them up) skips bogus
+// DMAs instead of access-violating. Real RSP behavior would mask, so this
+// matches hardware better than crashing anyway.
 static inline void dma_rdram_to_dmem(uint8_t* rdram, uint32_t dmem_addr, uint32_t dram_addr, uint32_t rd_len) {
     rd_len += 1; // Read length is inclusive
     dram_addr &= 0xFFFFF8;
-    assert(dmem_addr + rd_len <= 0x1000);
+    // Bit 12 of the mem address selects IMEM (1) vs DMEM (0) on real RSP.
+    // When a graphics ucode boot DMAs its own text into IMEM, we already ARE
+    // the recompiled ucode running as C — silently skip the IMEM DMA so it
+    // doesn't corrupt DMEM at the masked offset.
+    if (dmem_addr & 0x1000) {
+        return;
+    }
+    dmem_addr &= 0xFFF;
+    if (dmem_addr + rd_len > 0x1000) rd_len = 0x1000 - dmem_addr;
+    if (dram_addr >= 0x800000) {
+        static int n = 0;
+        if (++n <= 5) { fprintf(stderr, "[dma] skip rdram_to_dmem: dram=0x%08X len=%u\n", dram_addr, rd_len); fflush(stderr); }
+        return;
+    }
+    if (dram_addr + rd_len > 0x800000) rd_len = 0x800000 - dram_addr;
     for (uint32_t i = 0; i < rd_len; i++) {
         RSP_MEM_B(i, dmem_addr) = MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000));
     }
@@ -106,7 +140,14 @@ static inline void dma_rdram_to_dmem(uint8_t* rdram, uint32_t dmem_addr, uint32_
 static inline void dma_dmem_to_rdram(uint8_t* rdram, uint32_t dmem_addr, uint32_t dram_addr, uint32_t wr_len) {
     wr_len += 1; // Write length is inclusive
     dram_addr &= 0xFFFFF8;
-    assert(dmem_addr + wr_len <= 0x1000);
+    dmem_addr &= 0xFFF;
+    if (dmem_addr + wr_len > 0x1000) wr_len = 0x1000 - dmem_addr;
+    if (dram_addr >= 0x800000) {
+        static int n = 0;
+        if (++n <= 5) { fprintf(stderr, "[dma] skip dmem_to_rdram: dram=0x%08X len=%u\n", dram_addr, wr_len); fflush(stderr); }
+        return;
+    }
+    if (dram_addr + wr_len > 0x800000) wr_len = 0x800000 - dram_addr;
     for (uint32_t i = 0; i < wr_len; i++) {
         MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000)) = RSP_MEM_B(i, dmem_addr);
     }

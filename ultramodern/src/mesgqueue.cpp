@@ -126,7 +126,7 @@ void dequeue_external_messages(RDRAM_ARG1) {
     if (pass_drained > 1 || pass_lost > 0) {
         static int n = 0;
         if (++n <= 200) {
-            fprintf(stderr, "[mqdrain #%d] drained=%u deliv=%u lost=%u rq=%u\n",
+            if(0) fprintf(stderr, "[mqdrain #%d] drained=%u deliv=%u lost=%u rq=%u\n",
                     n, pass_drained, pass_delivered, pass_lost, pass_requeued);
             fflush(stderr);
         }

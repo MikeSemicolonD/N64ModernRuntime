@@ -404,7 +404,7 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
         static recomp_func_t *stub = +[](uint8_t* /*rdram*/, recomp_context* /*ctx*/) {
             static int n = 0;
             if (++n <= 20) {
-                fprintf(stderr, "[trace] get_function NULL stub invoked #%d\n", n);
+                if(false) fprintf(stderr, "[trace] get_function NULL stub invoked #%d\n", n);
                 fflush(stderr);
             }
         };
