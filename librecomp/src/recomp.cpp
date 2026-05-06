@@ -756,6 +756,11 @@ bool recomp::flashram_allowed() {
         save_type == SaveType::AllowAll;
 }
 
+// HWBP plumbing — defined in main.cpp at global scope with C linkage. Set as
+// soon as rdram is allocated so the watchdog thread can arm DR0 long before
+// any recompiled-game write touches the watched address.
+extern "C" volatile uint8_t* volatile g_recomp_rdram_for_wp_raw;
+
 void recomp::start(const recomp::Configuration& cfg) {
     project_version = cfg.project_version;
     recomp::check_all_stored_roms();
@@ -823,6 +828,11 @@ void recomp::start(const recomp::Configuration& cfg) {
         ultramodern::error_handling::message_box("Failed to allocate memory!");
         return;
     }
+
+    // Hand the rdram pointer to main.cpp's hwbp watchdog so it can arm DR0 on
+    // rdram+0x3CBC4 BEFORE recompiled threads start running. See file-scope
+    // extern declaration above recomp::start (extern "C" can't go inside a func).
+    g_recomp_rdram_for_wp_raw = rdram;
 
     recomp::register_heap_exports();
     recomp::mods::register_config_exports();

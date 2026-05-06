@@ -44,8 +44,11 @@ extern "C" void osDpSetStatus_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 extern "C" void osDpGetCounters_recomp(uint8_t* rdram, recomp_context* ctx) {
-    // Counter buffer pointer in r4 — write zeroes for all 8 counters
-    uint32_t buf_ptr = ctx->r4;
+    // Counter buffer pointer in r4 — write zeroes for all 8 counters.
+    // buf_ptr must stay 64-bit so the sign-extended MIPS address (e.g. 0xFFFFFFFF80...)
+    // survives the `- 0xFFFFFFFF80000000` subtraction inside MEM_W. Truncating to
+    // uint32_t produced an out-of-range host VA and access-violated.
+    gpr buf_ptr = ctx->r4;
     for (int i = 0; i < 8; i++) {
         MEM_W(i * 4, buf_ptr) = 0;
     }

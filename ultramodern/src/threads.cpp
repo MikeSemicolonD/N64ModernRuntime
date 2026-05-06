@@ -162,11 +162,51 @@ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
     }
 }
 
+// Validate t->context isn't a torn/corrupted pointer. The OSThread struct
+// lives in MIPS RDRAM, but its context field is a host pointer — recompiled
+// game code that scribbles near that field corrupts the host pointer. The
+// sentinel at offset 0 in UltraThreadContext lets us catch garbage values
+// before dereferencing inside signal(). Returns true if context looks live.
+//
+// On Windows we wrap the magic load in SEH so an unmapped pointer surfaces
+// as a soft skip rather than an access violation.
+#ifdef _WIN32
+static bool context_magic_ok_seh(UltraThreadContext* ctx) {
+    __try {
+        return ctx->magic == UltraThreadContext::kMagic;
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+#endif
+
+static bool context_looks_live(const char* who, OSThread* t) {
+    if (t->context == nullptr) {
+        return false;
+    }
+#ifdef _WIN32
+    bool ok = context_magic_ok_seh(t->context);
+#else
+    bool ok = (t->context->magic == UltraThreadContext::kMagic);
+#endif
+    if (!ok) {
+        static std::atomic<uint64_t> n{0};
+        uint64_t i = ++n;
+        if (i == 1 || (i & (i - 1)) == 0) {
+            fprintf(stderr, "[ultramodern] %s: thread %d has corrupt/unmapped context %p (#%llu) — skipping signal\n",
+                who, t->id, (void*)t->context, (unsigned long long)i);
+            fflush(stderr);
+        }
+        return false;
+    }
+    return true;
+}
+
 void resume_thread(OSThread* t) {
     debug_printf("[Thread] Resuming execution of thread %d\n", t->id);
-    if (t->context == nullptr) {
-        printf("[CRASH] resume_thread: thread %d has NULL context!\n", t->id); fflush(stdout);
-        std::abort();
+    if (!context_looks_live("resume_thread", t)) {
+        return;
     }
     t->context->running.signal();
 }
@@ -178,9 +218,10 @@ void run_next_thread(RDRAM_ARG1) {
 
     OSThread* to_run = TO_PTR(OSThread, ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue));
     debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
-    if (to_run->context == nullptr) {
-        printf("[CRASH] run_next_thread: thread %d has NULL context!\n", to_run->id); fflush(stdout);
-        std::abort();
+    if (!context_looks_live("run_next_thread", to_run)) {
+        // Bad context but queue isn't empty — try the next thread instead of
+        // recursing forever. Signaling nothing is wrong but avoids the AV.
+        return;
     }
     to_run->context->running.signal();
 }

@@ -22,6 +22,12 @@
 #include "ultramodern/threads.hpp"
 
 struct UltraThreadContext {
+    // Magic sentinel at offset 0 to detect when an OSThread::context pointer
+    // has been corrupted (recompiled game code writing into the surrounding
+    // MIPS RDRAM struct can scribble over the host pointer). resume_thread
+    // checks this before signaling — mismatch ⇒ skip + log instead of an AV.
+    static constexpr uint64_t kMagic = 0x4F535448435452ULL;  // "OSTHCTR"
+    uint64_t magic = kMagic;
     std::thread host_thread;
     moodycamel::LightweightSemaphore running;
     moodycamel::LightweightSemaphore initialized;
