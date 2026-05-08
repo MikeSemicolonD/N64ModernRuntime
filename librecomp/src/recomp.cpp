@@ -475,7 +475,20 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
     }
 
     recomp_func_t* func = get_function(addr);
-    printf("[DEBUG] thread 0x%08llX starting\n", (unsigned long long)addr); fflush(stdout);
+    {
+        // Per-thread "starting" log — fires once per recompiled thread that
+        // actually begins executing. Useful for thread-system bringup, but
+        // adds 15-20 lines at startup. ROGUESQ_LOG_THREAD_LIFECYCLE=1.
+        static const bool log_t = []{
+            const char *a = std::getenv("ROGUESQ_LOG_ALL");
+            if (a && *a && *a != '0') return true;
+            const char *e = std::getenv("ROGUESQ_LOG_THREAD_LIFECYCLE");
+            return e && *e && *e != '0';
+        }();
+        if (log_t) {
+            printf("[DEBUG] thread 0x%08llX starting\n", (unsigned long long)addr); fflush(stdout);
+        }
+    }
 #ifdef _WIN32
     // Let C++ exceptions (0xE06D7363) propagate so the outer try/catch in
     // threads.cpp can capture e.what(). Hardware SEH exceptions (AVs etc.)
@@ -708,17 +721,26 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                 }
 
                 recomp::init_heap(rdram, recomp::mod_rdram_start + mod_ram_used);
-                printf("[DEBUG] init_heap done\n"); fflush(stdout);
+                // Boot-init breadcrumbs. Useful when the game hangs before
+                // the entrypoint runs (heap setup or saving init). One-shot
+                // at startup. ROGUESQ_LOG_INIT=1.
+                static const bool log_init = []{
+                    const char *a = std::getenv("ROGUESQ_LOG_ALL");
+                    if (a && *a && *a != '0') return true;
+                    const char *e = std::getenv("ROGUESQ_LOG_INIT");
+                    return e && *e && *e != '0';
+                }();
+                if (log_init) { printf("[DEBUG] init_heap done\n"); fflush(stdout); }
 
                 save_type = game_entry.save_type;
-                printf("[DEBUG] calling init_saving\n"); fflush(stdout);
+                if (log_init) { printf("[DEBUG] calling init_saving\n"); fflush(stdout); }
                 ultramodern::init_saving(rdram);
-                printf("[DEBUG] init_saving done\n"); fflush(stdout);
+                if (log_init) { printf("[DEBUG] init_saving done\n"); fflush(stdout); }
 
                 try {
-                    printf("[DEBUG] calling entrypoint\n"); fflush(stdout);
+                    if (log_init) { printf("[DEBUG] calling entrypoint\n"); fflush(stdout); }
                     game_entry.entrypoint(rdram, context);
-                    printf("[DEBUG] entrypoint returned\n"); fflush(stdout);
+                    if (log_init) { printf("[DEBUG] entrypoint returned\n"); fflush(stdout); }
                 } catch (ultramodern::thread_terminated& terminated) {
                     printf("[DEBUG] entrypoint threw thread_terminated\n"); fflush(stdout);
                 }

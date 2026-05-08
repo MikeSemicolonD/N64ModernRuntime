@@ -8,6 +8,7 @@
 #include "librecomp/addresses.hpp"
 #include "librecomp/game.hpp"
 #include "librecomp/files.hpp"
+#include "librecomp/overlays.hpp"
 #include <ultramodern/ultra64.h>
 #include <ultramodern/ultramodern.hpp>
 
@@ -273,6 +274,19 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
         if (physical_addr >= recomp::rom_base) {
             // read cart rom
             recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
+
+            // ROGUESQ: when a ROM-to-RDRAM DMA brings in an overlay region,
+            // register its recompiled functions in func_map so subsequent
+            // calls to addresses in that range dispatch correctly. Internal
+            // bounds check in load_overlays makes this a no-op when no
+            // overlay section matches (regular asset/data reads pass through
+            // harmlessly). Without this, the game's loadOverlay() does the
+            // DMA but the recompile's func_map never learns about the
+            // overlay's functions — calls into the overlay's address range
+            // dispatch to whatever was registered earlier (e.g. a stale
+            // entry from a different overlay or none at all).
+            uint32_t rom_offset = physical_addr - recomp::rom_base;
+            load_overlays(rom_offset, (int32_t)rdram_address, size);
 
             // Send a message to the mq to indicate that the transfer completed
             ultramodern::enqueue_external_message_src(mq, 0, false, ultramodern::EventMessageSource::Pi);

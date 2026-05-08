@@ -58,17 +58,41 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
 #endif
 
 #if defined(_WIN32)
+namespace {
+    // Cached env-var read for thread-name registration logging. The [NAME]
+    // lines were added during a Win32 thread-naming crash investigation
+    // (wstring construction failing, SetThreadDescription COM init issues)
+    // and stay around for future debugging. Default off — they emit ~3
+    // lines per thread × ~20 threads at startup. ROGUESQ_LOG_THREADS=1
+    // (or ROGUESQ_LOG_ALL=1) to enable.
+    bool log_threads_native() {
+        static const bool v = []{
+            const char *a = std::getenv("ROGUESQ_LOG_ALL");
+            if (a && *a && *a != '0') return true;
+            const char *e = std::getenv("ROGUESQ_LOG_THREADS");
+            return e && *e && *e != '0';
+        }();
+        return v;
+    }
+}
+
 void ultramodern::set_native_thread_name(const std::string& name) {
-    printf("[NAME] set_native_thread_name('%s') begin\n", name.c_str()); fflush(stdout);
+    if (log_threads_native()) {
+        printf("[NAME] set_native_thread_name('%s') begin\n", name.c_str()); fflush(stdout);
+    }
     std::wstring wname{name.begin(), name.end()};
-    printf("[NAME] wstring constructed ok, len=%zu\n", wname.size()); fflush(stdout);
+    if (log_threads_native()) {
+        printf("[NAME] wstring constructed ok, len=%zu\n", wname.size()); fflush(stdout);
+    }
 
     HRESULT r;
     r = SetThreadDescription(
         GetCurrentThread(),
         wname.c_str()
     );
-    printf("[NAME] SetThreadDescription done (hr=0x%08X)\n", (unsigned)r); fflush(stdout);
+    if (log_threads_native()) {
+        printf("[NAME] SetThreadDescription done (hr=0x%08X)\n", (unsigned)r); fflush(stdout);
+    }
 }
 
 void ultramodern::set_native_thread_priority(ThreadPriority pri) {
@@ -248,15 +272,28 @@ void ultramodern::resume_thread_and_wait(RDRAM_ARG OSThread *t) {
 
 static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entrypoint, PTR(void) arg, UltraThreadContext* thread_context) {
     OSThread *self = TO_PTR(OSThread, self_);
-    printf("[Thread] _thread_func: self_=0x%08X self=%p id=%d\n",
-           (uint32_t)self_, (void*)self, self ? self->id : -1); fflush(stdout);
+    // [Thread] entry/name lines emit twice per thread × ~15 threads at
+    // startup. Useful for thread-system crash investigation; default off.
+    // Honors ROGUESQ_LOG_THREAD_LIFECYCLE / ROGUESQ_LOG_ALL.
+    static const bool log_t = []{
+        const char *a = std::getenv("ROGUESQ_LOG_ALL");
+        if (a && *a && *a != '0') return true;
+        const char *e = std::getenv("ROGUESQ_LOG_THREAD_LIFECYCLE");
+        return e && *e && *e != '0';
+    }();
+    if (log_t) {
+        printf("[Thread] _thread_func: self_=0x%08X self=%p id=%d\n",
+               (uint32_t)self_, (void*)self, self ? self->id : -1); fflush(stdout);
+    }
     debug_printf("[Thread] Thread created: %d\n", self->id);
     thread_self = self_;
     is_game_thread = true;
 
     // Set the thread name
     auto _thread_name = ultramodern::threads::get_game_thread_name(self);
-    printf("[Thread] about to set name '%s'\n", _thread_name.c_str()); fflush(stdout);
+    if (log_t) {
+        printf("[Thread] about to set name '%s'\n", _thread_name.c_str()); fflush(stdout);
+    }
     ultramodern::set_native_thread_name(_thread_name);
     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::High);
 

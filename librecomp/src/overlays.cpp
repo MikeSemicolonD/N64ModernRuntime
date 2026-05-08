@@ -192,6 +192,9 @@ void recomp::overlays::read_patch_data(uint8_t* rdram, gpr patch_data_address) {
 }
 
 extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
+    fprintf(stderr, "[overlay] load_overlays(rom=0x%08X, ram=0x%08X, size=0x%X)\n",
+        rom, (uint32_t)ram_addr, size);
+    fflush(stderr);
     // Search for the first section that's included in the loaded rom range
     // Sections were sorted by `init_overlays` so we can use the bounds functions
     auto lower = std::lower_bound(&sections_info.code_sections[0], &sections_info.code_sections[sections_info.num_code_sections], rom,
@@ -204,9 +207,22 @@ extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size) {
             return addr < entry.size + entry.rom_addr;
         }
     );
-    // Load the overlays that were found
-    for (auto it = lower; it != upper; ++it) {
+    // Load the overlays that were found.
+    // Defensive: when no section is fully contained in [rom, rom+size], the
+    // bounds search returns lower > upper (inverted). The original `it != upper`
+    // loop then walks past the array end into uninitialized memory. Use `<`
+    // instead so inverted bounds become a no-op.
+    int matched = 0;
+    for (auto it = lower; it < upper; ++it) {
+        fprintf(stderr, "[overlay]   matched section index=%u rom_addr=0x%08X size=0x%X\n",
+            (unsigned)it->index, it->rom_addr, it->size);
+        fflush(stderr);
         load_overlay(std::distance(&sections_info.code_sections[0], it), it->rom_addr - rom + ram_addr);
+        matched++;
+    }
+    if (matched == 0) {
+        fprintf(stderr, "[overlay]   no section matched (rom=0x%08X size=0x%X)\n", rom, size);
+        fflush(stderr);
     }
 }
 
