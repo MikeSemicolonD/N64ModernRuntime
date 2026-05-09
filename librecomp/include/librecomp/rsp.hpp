@@ -2,6 +2,7 @@
 #define __RSP_H__
 
 #include <cstdio>
+#include <atomic>
 
 #include "rsp_vu.hpp"
 #include "recomp.h"
@@ -148,6 +149,30 @@ static inline void dma_dmem_to_rdram(uint8_t* rdram, uint32_t dmem_addr, uint32_
         return;
     }
     if (dram_addr + wr_len > 0x800000) wr_len = 0x800000 - dram_addr;
+    // INSTRUMENT: log DMAs targeting the contested 0x4B7800 region. Filter for
+    // DMAs whose source DMEM bytes start with 0x9A or 0xC2 — that's the pattern
+    // we know appears in the final state. Also log first 5 of EACH unique src.
+    if (dram_addr >= 0x4B7800u && dram_addr < 0x4B7900u) {
+        extern uint8_t dmem[];
+        static std::atomic<uint64_t> s_dma_seq{0};
+        static std::atomic<uint32_t> s_pattern_seen{0};
+        uint64_t v = ++s_dma_seq;
+        bool is_9a = (dmem[dmem_addr+0] == 0x9A) || (dmem[dmem_addr+0] == 0xC2);
+        bool log_this = false;
+        if (v <= 5) log_this = true;
+        if (is_9a) {
+            uint32_t k = ++s_pattern_seen;
+            if (k <= 30) log_this = true;
+        }
+        if (log_this) {
+            fprintf(stderr, "[dma-7800 #%llu%s] dmem_addr=0x%03X dram_addr=0x%06X wr_len=%u  src8=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                (unsigned long long)v, is_9a ? "*" : "",
+                dmem_addr, dram_addr, wr_len,
+                dmem[dmem_addr+0], dmem[dmem_addr+1], dmem[dmem_addr+2], dmem[dmem_addr+3],
+                dmem[dmem_addr+4], dmem[dmem_addr+5], dmem[dmem_addr+6], dmem[dmem_addr+7]);
+            fflush(stderr);
+        }
+    }
     for (uint32_t i = 0; i < wr_len; i++) {
         MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000)) = RSP_MEM_B(i, dmem_addr);
     }

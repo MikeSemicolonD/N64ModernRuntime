@@ -203,6 +203,20 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
         }
     }
     
+    // Guard: mq->msg occasionally arrives non-canonical during cinematic
+    // (corruption cascade). Bail with success=false to avoid AV WRITE crash.
+    {
+        uint64_t msg_va = (uint64_t)(uint32_t)mq->msg;
+        if ((msg_va & 0xE0000000ULL) != 0x80000000ULL || mq->msgCount == 0) {
+            static int s_log = 0;
+            if (s_log++ < 4) {
+                fprintf(stderr, "[ultramodern] do_send: corrupt mq->msg=0x%08X or msgCount=%d — skipping\n",
+                    (uint32_t)mq->msg, mq->msgCount);
+                fflush(stderr);
+            }
+            return false;
+        }
+    }
     if (jam) {
         // Jams insert at the head of the message queue's buffer.
         mq->first = (mq->first + mq->msgCount - 1) % mq->msgCount;

@@ -196,6 +196,32 @@ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
 // as a soft skip rather than an access violation.
 #ifdef _WIN32
 static bool context_magic_ok_seh(UltraThreadContext* ctx) {
+    // SEH may not catch faults from non-canonical pointers (e.g. 0xFFFFFFFFFFFFFFFF
+    // is in the kernel-space high half and can bypass user-mode SEH). Reject
+    // obvious junk values up-front.
+    uintptr_t u = (uintptr_t)ctx;
+    if (u < 0x10000ULL || u >= 0x800000000000ULL) {
+        return false;
+    }
+    // PATCH (2026-05-08): SEH __try has been observed to NOT catch some user-mode
+    // AVs (e.g. address 0x1FF4DB80B0 — within bounds but not committed). Probe
+    // the page state with VirtualQuery before dereferencing.
+    MEMORY_BASIC_INFORMATION mbi{};
+    SIZE_T qres = VirtualQuery(reinterpret_cast<LPCVOID>(ctx), &mbi, sizeof(mbi));
+    if (qres == 0 || mbi.State != MEM_COMMIT) {
+        return false;
+    }
+    constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ
+        | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
+    if ((mbi.Protect & kReadable) == 0) {
+        return false;
+    }
+    // Also ensure the magic field doesn't span past the end of the committed region.
+    uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    uintptr_t end = base + static_cast<uintptr_t>(mbi.RegionSize);
+    if (u + sizeof(uint64_t) > end) {
+        return false;
+    }
     __try {
         return ctx->magic == UltraThreadContext::kMagic;
     }
