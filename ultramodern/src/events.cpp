@@ -555,9 +555,14 @@ extern "C" PTR(void) osViGetCurrentFramebuffer() {
 void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     OSTask* task = TO_PTR(OSTask, task_);
 
-    // Send gfx tasks to the graphics action queue
+    // Send gfx tasks to the graphics action queue.
+    // Dual-route for LLE: also enqueue on sp_task_queue so games using
+    // custom RSP microcode (recompiled via RSPRecomp) actually execute
+    // the ucode via task_thread_func → run_task. The HLE arm still runs
+    // for sp_complete/dp_complete signaling that the game thread expects.
     if (task->t.type == M_GFXTASK) {
         events_context.action_queue.enqueue(SpTaskAction{ *task });
+        events_context.sp_task_queue.enqueue(task);
     }
     // Set all other tasks as the RSP task
     else {
@@ -608,6 +613,12 @@ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle wind
         }
         throw std::runtime_error("Failed to initialize the renderer");
     }
+
+    // Seed both VI states with the dummy mode so the VI thread's first
+    // update_vi() has a valid mode pointer even if the game starts before
+    // calling osViSetMode. Otherwise update_vi dereferences a null mode.
+    events_context.vi.states[0].mode = &dummy_mode;
+    events_context.vi.states[1].mode = &dummy_mode;
 
     events_context.vi.thread = std::thread{ vi_thread_func };
 }

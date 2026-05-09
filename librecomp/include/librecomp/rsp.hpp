@@ -97,7 +97,15 @@ static inline void RSP_MEM_H_STORE(uint32_t offset, uint32_t addr, uint32_t val)
 static inline void dma_rdram_to_dmem(uint8_t* rdram, uint32_t dmem_addr, uint32_t dram_addr, uint32_t rd_len) {
     rd_len += 1; // Read length is inclusive
     dram_addr &= 0xFFFFF8;
-    assert(dmem_addr + rd_len <= 0x1000);
+    // Bit 12 of the mem address selects IMEM (1) vs DMEM (0) on real RSP.
+    // When a graphics ucode boot DMAs its own text into IMEM, we already ARE
+    // the recompiled ucode running as C — silently skip so it doesn't corrupt
+    // DMEM at the masked offset.
+    if (dmem_addr & 0x1000) return;
+    dmem_addr &= 0xFFF;
+    if (dmem_addr + rd_len > 0x1000) rd_len = 0x1000 - dmem_addr;
+    if (dram_addr >= 0x800000) return;
+    if (dram_addr + rd_len > 0x800000) rd_len = 0x800000 - dram_addr;
     for (uint32_t i = 0; i < rd_len; i++) {
         RSP_MEM_B(i, dmem_addr) = MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000));
     }
@@ -106,7 +114,13 @@ static inline void dma_rdram_to_dmem(uint8_t* rdram, uint32_t dmem_addr, uint32_
 static inline void dma_dmem_to_rdram(uint8_t* rdram, uint32_t dmem_addr, uint32_t dram_addr, uint32_t wr_len) {
     wr_len += 1; // Write length is inclusive
     dram_addr &= 0xFFFFF8;
-    assert(dmem_addr + wr_len <= 0x1000);
+    // Same IMEM/DMEM split as the rdram→dmem direction: silently skip IMEM
+    // writebacks, clamp lengths to actual memory bounds.
+    if (dmem_addr & 0x1000) return;
+    dmem_addr &= 0xFFF;
+    if (dmem_addr + wr_len > 0x1000) wr_len = 0x1000 - dmem_addr;
+    if (dram_addr >= 0x800000) return;
+    if (dram_addr + wr_len > 0x800000) wr_len = 0x800000 - dram_addr;
     for (uint32_t i = 0; i < wr_len; i++) {
         MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000)) = RSP_MEM_B(i, dmem_addr);
     }
