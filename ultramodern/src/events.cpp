@@ -24,47 +24,6 @@ void ultramodern::events::set_callbacks(const ultramodern::events::callbacks_t& 
     events_callbacks = callbacks;
 }
 
-// Path-4 cinematic-throttle infrastructure.
-//
-// The Rogue Squadron cinematic ends up single-buffered because its
-// recompiled buffer-state arbiter never frees slot 1 (state 5 → 0
-// transition is missing — see project_cinematic_buffer_arb.md). The
-// game keeps requesting osViSwapBuffer to the same fb 60+ times per
-// second; VI samples that fb at 60 Hz; we end up showing arbitrary
-// snapshots and the cinematic looks like it skips between
-// deterministic frames.
-//
-// On real N64, single-buffered code is naturally rate-limited by VI
-// hardware timing. Modern hardware runs the recompile much faster, so
-// the game writes new content over the unpresented previous frame.
-//
-// This throttle reproduces that natural rate-limit *only* for the
-// duplicate-fb case: when osViSwapBuffer is called with the same
-// frameBufPtr it was called with last time, block the calling thread
-// until the VI thread has done at least one update_vi cycle. Boot
-// double-buffering (which alternates fbs) passes through unchanged.
-namespace cinematic_throttle {
-    static std::atomic<uint64_t> g_vi_tick{0};
-    static std::mutex g_mutex;
-    static std::condition_variable g_cv;
-    static std::atomic<uint32_t> g_last_fb{0};
-
-    // Called from the VI thread after each update_vi cycle.
-    void on_vi_tick() {
-        g_vi_tick.fetch_add(1, std::memory_order_release);
-        g_cv.notify_all();
-    }
-
-    // Called from osViSwapBuffer. If `fb` equals the previously-requested
-    // fb, block until the VI thread has ticked. Otherwise pass through.
-    void on_swap_request(uint32_t fb) {
-        // Disabled 2026-05-06: turned out the cinematic blocker was Factor5
-        // SHADE=(0,0,0,0) collapsing to invisible, not a frame-pacing issue.
-        // Keep the bookkeeping for future use but skip the wait.
-        g_last_fb.store(fb, std::memory_order_release);
-    }
-}
-
 struct SpTaskAction {
     OSTask task;
 };
@@ -290,9 +249,6 @@ void vi_thread_func() {
 
         // Update VI registers and swap VI modes.
         events_context.vi.update_vi();
-
-        // Notify any thread blocked in osViSwapBuffer's duplicate-fb throttle.
-        cinematic_throttle::on_vi_tick();
 
         // DIAG-3: read first 4 bytes at VI ORIGIN to distinguish black/white/content
         // framebuffers. If fb_first == 0x00010001, the VI is pointing at a
@@ -579,13 +535,6 @@ void set_dummy_vi(bool odd) {
 }
 
 extern "C" void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr) {
-    // Path-4 throttle: if the game requests a swap to the same fb as last
-    // time (single-buffer cinematic signature), block until the VI thread
-    // has actually presented at least once. Boot's alternating-fb path
-    // passes through unchanged. See cinematic_throttle namespace above for
-    // why this exists.
-    cinematic_throttle::on_swap_request((uint32_t)frameBufPtr);
-
     std::lock_guard lock{ events_context.message_mutex };
     ViState* next_state = events_context.vi.get_next_state();
     next_state->framebuffer = frameBufPtr;

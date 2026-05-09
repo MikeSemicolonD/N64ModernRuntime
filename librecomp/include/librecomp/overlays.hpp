@@ -64,4 +64,14 @@ namespace recomp {
 extern "C" void load_overlays(uint32_t rom, int32_t ram_addr, uint32_t size);
 extern "C" void unload_overlays(int32_t ram_addr, uint32_t size);
 
+namespace recomp {
+    // Hook fired after every successful ROM-to-RDRAM PI DMA. Default null —
+    // most games preregister all overlays at boot. Games whose overlays are
+    // loaded on-demand via PI DMA (e.g. Rogue Squadron) can register a
+    // callback that invokes `load_overlays(rom_offset, rdram_address, size)`
+    // to keep the recompile's func_map in sync.
+    using post_pi_dma_callback_t = void(*)(uint32_t rom_offset, int32_t rdram_address, uint32_t size);
+    void set_post_pi_dma_callback(post_pi_dma_callback_t cb);
+}
+
 #endif

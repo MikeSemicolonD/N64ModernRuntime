@@ -14,6 +14,14 @@
 
 static std::vector<uint8_t> rom;
 
+namespace {
+    recomp::post_pi_dma_callback_t s_post_pi_dma_cb = nullptr;
+}
+
+void recomp::set_post_pi_dma_callback(recomp::post_pi_dma_callback_t cb) {
+    s_post_pi_dma_cb = cb;
+}
+
 bool recomp::is_rom_loaded() {
     return !rom.empty();
 }
@@ -275,18 +283,13 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
             // read cart rom
             recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
 
-            // ROGUESQ: when a ROM-to-RDRAM DMA brings in an overlay region,
-            // register its recompiled functions in func_map so subsequent
-            // calls to addresses in that range dispatch correctly. Internal
-            // bounds check in load_overlays makes this a no-op when no
-            // overlay section matches (regular asset/data reads pass through
-            // harmlessly). Without this, the game's loadOverlay() does the
-            // DMA but the recompile's func_map never learns about the
-            // overlay's functions — calls into the overlay's address range
-            // dispatch to whatever was registered earlier (e.g. a stale
-            // entry from a different overlay or none at all).
-            uint32_t rom_offset = physical_addr - recomp::rom_base;
-            load_overlays(rom_offset, (int32_t)rdram_address, size);
+            // Notify the host if it cares about post-PI-DMA events (e.g. for
+            // on-demand overlay registration). Default null; games that
+            // preregister all overlays at boot leave this unset.
+            if (s_post_pi_dma_cb != nullptr) {
+                uint32_t rom_offset = physical_addr - recomp::rom_base;
+                s_post_pi_dma_cb(rom_offset, (int32_t)rdram_address, size);
+            }
 
             // Send a message to the mq to indicate that the transfer completed
             ultramodern::enqueue_external_message_src(mq, 0, false, ultramodern::EventMessageSource::Pi);
