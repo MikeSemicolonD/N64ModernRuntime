@@ -277,6 +277,10 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
             return;
         }
 
+        // Cache the task type before running — run_task can clobber the
+        // pointer's contents (DMA, etc).
+        const uint32_t task_type = task->t.type;
+
         if (!ultramodern::rsp::run_task(PASS_RDRAM task)) {
             fprintf(stderr, "Failed to execute task type: %" PRIu32 "\n", task->t.type);
             ULTRAMODERN_QUICK_EXIT();
@@ -284,6 +288,8 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
 
         // Tell the game that the RSP has completed
         sp_complete();
+
+        (void)task_type;
     }
 }
 
@@ -369,6 +375,14 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 ultramodern::extensions::on_displaylist_submitted(displaylist);
 
                 [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
+                // RogueSquadron64Recomp: send_dl RE-ENABLED. RT64 has a
+                // GBI_F3DFACTOR5 implementation (rt64_gbi_f3dfactor5.cpp)
+                // and the Factor 5 ucode hash IS in RT64's database
+                // (rt64_gbi.cpp lines 166, 264). HLE GBI handles Factor 5
+                // commands properly. The previous LLE-only approach
+                // bypasses the registered GBI and submits raw RDP that
+                // confuses RT64 state. See project_factor5_lle_breakthrough.md
+                // for context but supersede with HLE path.
                 renderer_context->send_dl(&task_action->task);
                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
 
@@ -555,16 +569,13 @@ extern "C" PTR(void) osViGetCurrentFramebuffer() {
 void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     OSTask* task = TO_PTR(OSTask, task_);
 
-    // Send gfx tasks to the graphics action queue.
-    // Dual-route for LLE: also enqueue on sp_task_queue so games using
-    // custom RSP microcode (recompiled via RSPRecomp) actually execute
-    // the ucode via task_thread_func → run_task. The HLE arm still runs
-    // for sp_complete/dp_complete signaling that the game thread expects.
+    // 2026-05-10: GFX tasks now route to the gfx_thread's action_queue so
+    // RT64's registered F3DFACTOR5 GBI handles them via send_dl →
+    // processDisplayLists(isHLE=true). Non-GFX tasks (audio, etc.) still go
+    // to sp_task_queue → task_thread_func → rsp::run_task (LLE).
     if (task->t.type == M_GFXTASK) {
         events_context.action_queue.enqueue(SpTaskAction{ *task });
-        events_context.sp_task_queue.enqueue(task);
     }
-    // Set all other tasks as the RSP task
     else {
         events_context.sp_task_queue.enqueue(task);
     }
