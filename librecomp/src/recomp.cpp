@@ -475,7 +475,43 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
     }
 
     recomp_func_t* func = get_function(addr);
+#ifdef _WIN32
+    // SEH wrapper — Factor 5's cinematic walks uninitialized linked-list
+    // tables that randomly produce wild pointer dereferences in different
+    // funcs each run. Catching the AV here lets the thread exit cleanly
+    // and the rest of the system (audio, VI, main thread) keeps running.
+    // Logs the AV target address + faulting instruction PC + a few stack
+    // frames so we can identify which recompiled function triggered it.
+    uintptr_t av_target = 0;
+    uintptr_t av_pc = 0;
+    DWORD av_code = 0;
+    ULONG_PTR av_kind = 0;  // 0=read, 1=write, 8=execute(DEP)
+    void* av_frames[8] = {};
+    USHORT av_frame_count = 0;
+    __try {
+        func(rdram, &ctx);
+    }
+    __except (
+        av_kind = GetExceptionInformation()->ExceptionRecord->ExceptionInformation[0],
+        av_target = (uintptr_t)GetExceptionInformation()->ExceptionRecord->ExceptionInformation[1],
+        av_pc = (uintptr_t)GetExceptionInformation()->ExceptionRecord->ExceptionAddress,
+        av_code = GetExceptionInformation()->ExceptionRecord->ExceptionCode,
+        av_frame_count = RtlCaptureStackBackTrace(0, 8, av_frames, NULL),
+        EXCEPTION_EXECUTE_HANDLER
+    ) {
+        const char* kind_str = (av_kind == 0) ? "READ" : (av_kind == 1) ? "WRITE" : (av_kind == 8) ? "EXEC" : "?";
+        fprintf(stderr, "[recomp] SEH caught: thread_entry=0x%08X code=0x%08X kind=%s av_target=0x%p av_pc=0x%p\n",
+                (uint32_t)addr, (unsigned)av_code, kind_str, (void*)av_target, (void*)av_pc);
+        fprintf(stderr, "[recomp]   call stack (%u frames):", (unsigned)av_frame_count);
+        for (USHORT i = 0; i < av_frame_count; i++) {
+            fprintf(stderr, " %p", av_frames[i]);
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+#else
     func(rdram, &ctx);
+#endif
 }
 
 void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
