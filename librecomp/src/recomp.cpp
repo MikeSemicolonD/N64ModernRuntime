@@ -500,11 +500,15 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
         EXCEPTION_EXECUTE_HANDLER
     ) {
         const char* kind_str = (av_kind == 0) ? "READ" : (av_kind == 1) ? "WRITE" : (av_kind == 8) ? "EXEC" : "?";
-        fprintf(stderr, "[recomp] SEH caught: thread_entry=0x%08X code=0x%08X kind=%s av_target=0x%p av_pc=0x%p\n",
-                (uint32_t)addr, (unsigned)av_code, kind_str, (void*)av_target, (void*)av_pc);
-        fprintf(stderr, "[recomp]   call stack (%u frames):", (unsigned)av_frame_count);
+        // Module base, so the av_pc / frames can be resolved to RVAs despite
+        // ASLR (tools/resolve-rva.ps1 expects RVAs, not absolute addresses).
+        uintptr_t mod_base = (uintptr_t)GetModuleHandleW(NULL);
+        fprintf(stderr, "[recomp] SEH caught: thread_entry=0x%08X code=0x%08X kind=%s av_target=0x%p av_pc=0x%p av_rva=0x%llX\n",
+                (uint32_t)addr, (unsigned)av_code, kind_str, (void*)av_target, (void*)av_pc,
+                (unsigned long long)(av_pc - mod_base));
+        fprintf(stderr, "[recomp]   call stack RVAs (%u frames):", (unsigned)av_frame_count);
         for (USHORT i = 0; i < av_frame_count; i++) {
-            fprintf(stderr, " %p", av_frames[i]);
+            fprintf(stderr, " 0x%llX", (unsigned long long)((uintptr_t)av_frames[i] - mod_base));
         }
         fprintf(stderr, "\n");
         fflush(stderr);
