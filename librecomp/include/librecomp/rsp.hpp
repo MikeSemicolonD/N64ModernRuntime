@@ -2,6 +2,7 @@
 #define __RSP_H__
 
 #include <cstdio>
+#include <cstdlib>
 
 #include "rsp_vu.hpp"
 #include "recomp.h"
@@ -97,6 +98,13 @@ static inline void RSP_MEM_H_STORE(uint32_t offset, uint32_t addr, uint32_t val)
 static inline void dma_rdram_to_dmem(uint8_t* rdram, uint32_t dmem_addr, uint32_t dram_addr, uint32_t rd_len) {
     rd_len += 1; // Read length is inclusive
     dram_addr &= 0xFFFFF8;
+    // Catch IMEM-target DMAs (overlays/self-modifying code) — confirms whether the synth ucode
+    // rewrites its own IMEM (the suspected synth-silence root).
+    { static int li=-1; if(li<0){const char*e=std::getenv("ROGUESQ_LOG_IMEMDMA");li=(e&&e[0]&&e[0]!='0')?1:0;}
+      static int ni=0; if(li && (dmem_addr & 0x1000) && ni<40){ ++ni;
+        fprintf(stderr,"[imemdma] IMEM dst=0x%X <- dram=0x%06X len=%u first8=%02X%02X%02X%02X%02X%02X%02X%02X\n",
+          dmem_addr, dram_addr, rd_len, rdram[dram_addr^3],rdram[(dram_addr+1)^3],rdram[(dram_addr+2)^3],
+          rdram[(dram_addr+3)^3],rdram[(dram_addr+4)^3],rdram[(dram_addr+5)^3],rdram[(dram_addr+6)^3],rdram[(dram_addr+7)^3]); fflush(stderr); } }
     // Bit 12 of the mem address selects IMEM (1) vs DMEM (0) on real RSP.
     // When a graphics ucode boot DMAs its own text into IMEM, we already ARE
     // the recompiled ucode running as C — silently skip so it doesn't corrupt
@@ -104,8 +112,22 @@ static inline void dma_rdram_to_dmem(uint8_t* rdram, uint32_t dmem_addr, uint32_
     if (dmem_addr & 0x1000) return;
     dmem_addr &= 0xFFF;
     if (dmem_addr + rd_len > 0x1000) rd_len = 0x1000 - dmem_addr;
-    if (dram_addr >= 0x800000) return;
-    if (dram_addr + rd_len > 0x800000) rd_len = 0x800000 - dram_addr;
+    // Read bound raised to 16MB so the MusyX synth can DMA samples from the
+    // permanent sample-bank region placed above the game's 8MB (osMemSize=8MB,
+    // so the game never touches 8-16MB; the host RDRAM is 512MB committed).
+    if (dram_addr >= 0x1000000) return;
+    if (dram_addr + rd_len > 0x1000000) rd_len = 0x1000000 - dram_addr;
+    { static int lg=-1; if(lg<0){const char*e=std::getenv("ROGUESQ_LOG_SAMPDMA");lg=(e&&e[0]&&e[0]!='0')?1:0;}
+      static int n=0; if(lg && dram_addr>=0x1A0000u && dram_addr<0x600000u && n<24){ ++n;  // samp bank loaded ~0x1AE9A0 (below 8MB); catch its sample fetches
+        fprintf(stderr,"[sampdma] dram=0x%06X len=%u first8=%02X%02X%02X%02X%02X%02X%02X%02X\n", dram_addr, rd_len,
+          rdram[dram_addr^3],rdram[(dram_addr+1)^3],rdram[(dram_addr+2)^3],rdram[(dram_addr+3)^3],
+          rdram[(dram_addr+4)^3],rdram[(dram_addr+5)^3],rdram[(dram_addr+6)^3],rdram[(dram_addr+7)^3]); fflush(stderr); } }
+    // What fills the synth's per-voice region (DMEM 0x340..0x600, incl. the 0x350 voice list)?
+    { static int lg2=-1; if(lg2<0){const char*e=std::getenv("ROGUESQ_LOG_DMEMFILL");lg2=(e&&e[0]&&e[0]!='0')?1:0;}
+      static int n2=0; if(lg2 && dmem_addr<0x1000u && n2<60){ ++n2;
+        fprintf(stderr,"[dmemfill] dmem=0x%03X <- dram=0x%06X len=%u first8=%02X%02X%02X%02X%02X%02X%02X%02X\n",
+          dmem_addr, dram_addr, rd_len, rdram[dram_addr^3],rdram[(dram_addr+1)^3],rdram[(dram_addr+2)^3],
+          rdram[(dram_addr+3)^3],rdram[(dram_addr+4)^3],rdram[(dram_addr+5)^3],rdram[(dram_addr+6)^3],rdram[(dram_addr+7)^3]); fflush(stderr); } }
     for (uint32_t i = 0; i < rd_len; i++) {
         RSP_MEM_B(i, dmem_addr) = MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000));
     }

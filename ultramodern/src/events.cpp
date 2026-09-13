@@ -6,8 +6,52 @@
 #include <unordered_map>
 #include <utility>
 #include <mutex>
+#include <condition_variable>
 #include <queue>
+#include <deque>
 #include <cstring>
+#include <cstdlib>
+#include "blockingconcurrentqueue.h"
+extern "C" volatile long long g_rs64_pdl_us;
+extern "C" volatile unsigned g_f5_task_hops, g_f5_task_faces;   // rt64 F5 GBI diagnostics
+// RogueSquadron64Recomp (2026-09-08): on hardware the RSP finishes a graphics task well before the next
+// retrace, so the game never sees a VI while its list is still being read. RT64's parse takes 10-70 ms,
+// during which the game (woken by the VI) releases and reuses the list's chunks under the parser. Hold the
+// VI event while a graphics parse is in flight (bounded). ROGUESQ_VI_WAIT_PARSE=0 disables.
+static std::atomic<int> g_gfx_parse_inflight{0};
+static std::mutex g_gfx_parse_mutex;
+static std::condition_variable g_gfx_parse_cv;
+static bool parse_snapshot_enabled();
+static bool vi_wait_parse_enabled() {
+    // Default: on only when the parse does NOT run from a snapshot (ROGUESQ_VI_WAIT_PARSE=1/0 overrides).
+    static const bool on = [](){ const char* e = std::getenv("ROGUESQ_VI_WAIT_PARSE"); if (e && e[0]) return e[0] != '0'; return !parse_snapshot_enabled(); }();
+    return on;
+}
+static bool gfx_sync_submit_enabled();
+extern moodycamel::LightweightSemaphore g_gfx_task_parsed;
+// Called from the game's chunk-release functions (hand edits in funcs_3.c): a release while RT64 is still
+// reading the list rewrites chunk headers under the parser. Hardware never gets here (the RSP is done in
+// a few ms); wait for the in-flight parse instead. Bounded. ROGUESQ_VI_WAIT_PARSE=0 disables.
+// Count a graphics task as in flight from the moment the game submits it (osSpTaskStartGo), not from
+// when the gfx thread dequeues it: the game keeps running on its own host thread in between.
+extern "C" volatile unsigned g_rs64_gfx_requests = 0;
+extern "C" void rs64_gfx_task_submitted(void) {
+    ++g_rs64_gfx_requests;
+    g_gfx_parse_inflight.fetch_add(1, std::memory_order_acq_rel);
+}
+extern "C" void rs64_wait_gfx_parse(void) {
+    if (!vi_wait_parse_enabled() || !g_gfx_parse_inflight.load(std::memory_order_acquire)) return;
+    std::unique_lock<std::mutex> plock{ g_gfx_parse_mutex };
+    g_gfx_parse_cv.wait_for(plock, std::chrono::milliseconds(500), []{ return g_gfx_parse_inflight.load(std::memory_order_acquire) == 0; });
+}
+// Slice of the same wait (at most `ms`); returns nonzero while a parse is still in flight. The N64-side
+// waiter yields between slices so the retrace thread (audio synth) keeps running during a long parse.
+extern "C" int rs64_gfx_parse_inflight_wait(int ms) {
+    if (!vi_wait_parse_enabled() || !g_gfx_parse_inflight.load(std::memory_order_acquire)) return 0;
+    std::unique_lock<std::mutex> plock{ g_gfx_parse_mutex };
+    g_gfx_parse_cv.wait_for(plock, std::chrono::milliseconds(ms), []{ return g_gfx_parse_inflight.load(std::memory_order_acquire) == 0; });
+    return g_gfx_parse_inflight.load(std::memory_order_acquire) != 0;
+}
 
 #include "blockingconcurrentqueue.h"
 
@@ -26,7 +70,32 @@ void ultramodern::events::set_callbacks(const ultramodern::events::callbacks_t& 
 
 struct SpTaskAction {
     OSTask task;
+    uint8_t* snapshot = nullptr;   // RogueSquadron64Recomp: RDRAM copy taken at task start (parse input)
 };
+// RogueSquadron64Recomp (2026-09-08): the RSP consumes a display list within a few ms of task start, before
+// the game recycles its chunks; RT64's parse takes 7-100 ms (GPU sync per task) and was reading chunks the
+// game had already rebuilt. Parse from a copy of RDRAM taken at task start instead (ROGUESQ_PARSE_SNAPSHOT=0
+// disables). Three 8 MB buffers: at most one task parsing + one queued.
+static bool parse_snapshot_enabled() {
+    static const bool on = [](){ const char* e = std::getenv("ROGUESQ_PARSE_SNAPSHOT"); return !(e && e[0] == '0'); }();
+    return on;
+}
+static uint8_t* take_rdram_snapshot(const uint8_t* rdram) {
+    // RT64's F5 GBI writes scratch (vertices @0xA00000, viewport @0xA01000) ABOVE the 8 MB game RAM, and
+    // reads/writes it through state->RDRAM (= this buffer during the parse). An 8 MB buffer sends those
+    // writes ~2 MB out of bounds -> heap corruption / AVs in f5_set_viewport (the in-mission instability).
+    // Size the buffer past the scratch region. RogueSquadron64Recomp (2026-09-09).
+    static constexpr size_t kSnapSize = 0xC00000;   // 12 MB: 8 MB game RAM + F5 scratch at 0xA0xxxx
+    static uint8_t* bufs[3] = { nullptr, nullptr, nullptr };
+    static unsigned next = 0;
+    uint8_t*& b = bufs[next++ % 3];
+    if (!b) { b = static_cast<uint8_t*>(std::malloc(kSnapSize)); if (b) std::memset(b, 0, kSnapSize); }
+    if (b) std::memcpy(b, rdram, 0x800000);
+    return b;
+}
+extern "C" uint8_t* g_rs64_parse_rdram = nullptr;   // read by send_dl: parse input when non-null
+extern "C" unsigned long long rs64_cine_iter_get(void);   // host cinematic-loop iteration (matches ROGUESQ_DUMP_RDRAM_ON_CINE_ITER / PJ64 cine_frame<n> goldens)
+extern "C" volatile int g_active_overlay;                 // 0=mission/gameplay, 1=menu, 2=cinematic, -1=none (rs64_load_overlay)
 
 struct ScreenUpdateAction {
     ultramodern::renderer::ViRegs regs;
@@ -175,6 +244,45 @@ extern moodycamel::LightweightSemaphore graphics_shutdown_ready;
 
 void set_dummy_vi(bool odd);
 
+// RogueSquadron64Recomp (2026-09-08): hardware raises the AI interrupt each time a DMA buffer finishes
+// playing (~bytes / (4 * rate) seconds apart), and MusyX synthesizes the next buffer on that interrupt.
+// Firing it once per VI (60/s) starved production to about half of real time (constant underruns). This
+// thread fires the AI event at the consumption cadence of the buffer the game last queued.
+// ROGUESQ_AI_CONSUMPTION_PACED=0 restores the per-VI event (see the VI thread).
+extern std::atomic<uint32_t> g_rs64_ai_last_bytes;
+uint32_t rs64_audio_sample_rate();
+static bool ai_consumption_paced() {
+    static const bool on = [](){ const char* e = std::getenv("ROGUESQ_AI_CONSUMPTION_PACED"); return !(e && e[0] == '0'); }();
+    return on;
+}
+extern std::mutex g_rs64_ai_mutex;
+extern std::deque<std::chrono::steady_clock::time_point> g_rs64_ai_deadlines;
+void ai_thread_func() {
+    ultramodern::set_native_thread_name("AI Thread");
+    ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Critical);
+    using namespace std::chrono_literals;
+    while (!exited) {
+        // Next DMA-complete deadline (one per buffer the game queued); poll briefly when none is pending.
+        std::chrono::steady_clock::time_point due{};
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lk(g_rs64_ai_mutex);
+            if (!g_rs64_ai_deadlines.empty()) { due = g_rs64_ai_deadlines.front(); have = true; }
+        }
+        if (!have) { std::this_thread::sleep_for(1ms); continue; }
+        std::this_thread::sleep_until(due);
+        {
+            std::lock_guard<std::mutex> lk(g_rs64_ai_mutex);
+            if (!g_rs64_ai_deadlines.empty()) g_rs64_ai_deadlines.pop_front();
+        }
+        if (!ultramodern::is_game_started()) continue;
+        std::lock_guard lock{ events_context.message_mutex };
+        if (events_context.ai.mq != NULLPTR) {
+            ultramodern::enqueue_external_message_src(events_context.ai.mq, events_context.ai.msg, false, ultramodern::EventMessageSource::Ai);
+        }
+    }
+}
+
 void vi_thread_func() {
     ultramodern::set_native_thread_name("VI Thread");
     // This thread should be prioritized over every other thread in the application, as it's what allows
@@ -226,7 +334,16 @@ void vi_thread_func() {
         // If the game has started, handle sending VI and AI events.
         if (ultramodern::is_game_started()) {
             remaining_retraces--;
-            
+            // Hold this retrace while a graphics parse is in flight (before taking message_mutex: the
+            // completion path needs it). Bounded so a runaway parse cannot stop the VI clock.
+            // Off by default (2026-09-08): the game thread already waits at frame start, and holding the
+            // retrace starves the synth tick (audio dropouts). ROGUESQ_VI_HOLD_PARSE=1 re-enables.
+            static const bool s_vi_hold = [](){ const char* e = std::getenv("ROGUESQ_VI_HOLD_PARSE"); return e && e[0] && e[0] != '0'; }();
+            if (s_vi_hold && remaining_retraces == 0 && vi_wait_parse_enabled() && g_gfx_parse_inflight.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> plock{ g_gfx_parse_mutex };
+                g_gfx_parse_cv.wait_for(plock, std::chrono::milliseconds(50), []{ return g_gfx_parse_inflight.load(std::memory_order_acquire) == 0; });
+            }
+
             std::lock_guard lock{ events_context.message_mutex };
             ViState* cur_state = events_context.vi.get_cur_state();
             if (remaining_retraces == 0) {
@@ -237,9 +354,23 @@ void vi_thread_func() {
                 }
                 remaining_retraces = cur_state->retrace_count;
             }
-            if (events_context.ai.mq != NULLPTR) {
-                // Send a message to the VI queue, and do not set it to be requeued if the queue was full for the same reason as the VI message above.
-                ultramodern::enqueue_external_message_src(events_context.ai.mq, events_context.ai.msg, false, ultramodern::EventMessageSource::Ai);
+            if (!ai_consumption_paced() && events_context.ai.mq != NULLPTR) {
+                // The AI event wakes the game's audio thread to synth + submit one
+                // ~768-byte buffer. Firing it once per VI (60/s) only sustains ~half of
+                // 22050Hz (the audio underproduces -> crackle/cut). On hardware the AI
+                // interrupt fires per buffer CONSUMED (~120/s here). Fire N per retrace
+                // (default 2 ~= 120/s for 192-frame buffers @22050). ROGUESQ_AI_PER_VI
+                // overrides (1 = old behavior). Extra messages past what the audio thread
+                // can dequeue are simply dropped (requeue=false), so this self-limits.
+                // Default 1 (one per VI): firing more (=2) DID reach ~realtime production
+                // but the game then submits buffers the synth hasn't filled yet -> garbled
+                // / screechy. So AI-rate forcing is the wrong lever here; left as an opt-in
+                // knob for experiments. Real fix = let the synth fill before submit (async).
+                static int n_ai = -1;
+                if (n_ai < 0) { const char* e = std::getenv("ROGUESQ_AI_PER_VI"); n_ai = (e && e[0]) ? atoi(e) : 1; if (n_ai < 1) n_ai = 1; if (n_ai > 8) n_ai = 8; }
+                for (int i = 0; i < n_ai; ++i) {
+                    ultramodern::enqueue_external_message_src(events_context.ai.mq, events_context.ai.msg, false, ultramodern::EventMessageSource::Ai);
+                }
             }
         }
 
@@ -259,6 +390,29 @@ void dp_complete() {
     uint8_t* rdram = events_context.rdram;
     std::lock_guard lock{ events_context.message_mutex };
     ultramodern::enqueue_external_message_src(events_context.dp.mq, events_context.dp.msg, false, ultramodern::EventMessageSource::Dp);
+}
+
+// Counts async audio synth tasks that have been queued but not yet finished
+// writing their output. wait_for_pending_audio_synth() (called from
+// osAiSetNextBuffer) blocks until this drains, so the game never plays a
+// half-synthesized buffer. Only used when ROGUESQ_AUDIO_ASYNC is on.
+static std::atomic<int> g_pending_audio_synth{ 0 };
+static std::mutex g_audio_synth_mutex;
+static std::condition_variable g_audio_synth_cv;
+
+// ROGUESQ_AUDIO_ASYNC=1: run the slow MusyX synth without blocking the game frame.
+static bool audio_async_enabled() {
+    static int s_async = -1;
+    if (s_async < 0) { const char* e = std::getenv("ROGUESQ_AUDIO_ASYNC"); s_async = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return s_async != 0;
+}
+
+void ultramodern::wait_for_pending_audio_synth() {
+    if (g_pending_audio_synth.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    std::unique_lock lock{ g_audio_synth_mutex };
+    g_audio_synth_cv.wait(lock, [] { return g_pending_audio_synth.load(std::memory_order_acquire) == 0; });
 }
 
 void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_ready) {
@@ -281,13 +435,36 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
         // pointer's contents (DMA, etc).
         const uint32_t task_type = task->t.type;
 
+        // ROGUESQ_AUDIO_ASYNC=1: the MusyX synth is slow (~42ms/task). Holding
+        // sp_complete until it finishes stalls the game (which blocks on the SP
+        // queue) by ~4 audio tasks/frame → ~4fps. Mirror the gfx path: signal
+        // completion BEFORE running the synth so the game keeps rendering, and
+        // synthesize in the background. The synth has ~1.5x realtime headroom so
+        // the queue stays bounded; audio gains ~1 task of latency (double-buffered).
+        // Relies on the game preserving the audio input until the next task (same
+        // assumption the gfx path makes). Default off.
+        const bool early_complete = (audio_async_enabled() && task_type == M_AUDTASK);
+        if (early_complete) {
+            sp_complete();
+        }
+
         if (!ultramodern::rsp::run_task(PASS_RDRAM task)) {
             fprintf(stderr, "Failed to execute task type: %" PRIu32 "\n", task->t.type);
             ULTRAMODERN_QUICK_EXIT();
         }
 
-        // Tell the game that the RSP has completed
-        sp_complete();
+        // Tell the game that the RSP has completed (unless already signaled early).
+        if (!early_complete) {
+            sp_complete();
+        }
+        else {
+            // The synth has now finished filling its output buffer; release any
+            // osAiSetNextBuffer caller waiting on this buffer (see wait_for_pending_audio_synth).
+            if (g_pending_audio_synth.fetch_sub(1, std::memory_order_release) <= 1) {
+                std::lock_guard lock{ g_audio_synth_mutex };
+                g_audio_synth_cv.notify_all();
+            }
+        }
 
         (void)task_type;
     }
@@ -368,7 +545,11 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
                 // is finished as well, so sending this early shouldn't be an issue in most cases.
                 // If this causes issues then the logic can be replaced with responding to yield requests.
-                sp_complete();
+                // RogueSquadron64Recomp (2026-09-07): ROGUESQ_SP_COMPLETE_AFTER_PARSE=1 delivers the SP-done
+                // event only after the list has been parsed, as the RSP would. With the early completion the
+                // game recycles DL chunks the HLE is still walking (phantom commands / garbage SETCIMG).
+                static const bool s_sp_after = [](){ const char* e = std::getenv("ROGUESQ_SP_COMPLETE_AFTER_PARSE"); const char* v = std::getenv("ROGUESQ_VI_DRIVEN_LOOP"); if (e && *e) return *e != '0'; return !(v && *v && *v == '0'); }();   // default on with the VI-driven loop
+                if (!s_sp_after) sp_complete();
                 ultramodern::measure_input_latency();
 
                 PTR(u64) displaylist = task_action->task.t.data_ptr;
@@ -383,10 +564,53 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 // bypasses the registered GBI and submits raw RDP that
                 // confuses RT64 state. See project_factor5_lle_breakthrough.md
                 // for context but supersede with HLE path.
+                // ROGUESQ_LOG_GFX_TASK=1: one line per gfx task around the parse (stall diagnosis).
+                static const bool s_log_task = [](){ const char* e = std::getenv("ROGUESQ_LOG_GFX_TASK"); return e && *e && *e != '0'; }();
+                static unsigned s_task_n = 0; ++s_task_n;
+                if (s_log_task) { fprintf(stderr, "[gfx-task #%u] parse dl=0x%08X\n", s_task_n, (uint32_t)displaylist); fflush(stderr); }
+                g_rs64_parse_rdram = task_action->snapshot;
                 renderer_context->send_dl(&task_action->task);
+                g_rs64_parse_rdram = nullptr;
+                // RogueSquadron64Recomp (2026-09-09): dump the EXACT snapshot the parser just walked, so
+                // tools/validate/f5_dl_walk.py sees the parser-visible DL, not live RDRAM (which races with
+                // post-parse chunk recycling). Anchored to the cinematic frame counter (RDRAM 0x13889C);
+                // written big-endian (i^3) once. ROGUESQ_DUMP_PARSE_SNAPSHOT_ON_FC=<n> [+ _PATH].
+                static const long s_dump_iter = [](){ const char* e = std::getenv("ROGUESQ_DUMP_PARSE_SNAPSHOT_ON_ITER"); return (e && *e) ? std::atol(e) : -1L; }();
+                static const long s_dump_ovl = [](){ const char* e = std::getenv("ROGUESQ_DUMP_PARSE_SNAPSHOT_ON_OVERLAY"); return (e && *e) ? std::atol(e) : -1L; }();
+                static const int s_dump_cnt = [](){ const char* e = std::getenv("ROGUESQ_DUMP_PARSE_SNAPSHOT_COUNT"); return (e && *e) ? std::atoi(e) : 1; }();
+                if ((s_dump_iter >= 0 || s_dump_ovl >= 0) && task_action->snapshot) {
+                    // Once the cinematic-loop iteration reaches the target (the SAME landmark as
+                    // ROGUESQ_DUMP_RDRAM_ON_CINE_ITER and the PJ64 cine_frame<n> goldens - NOT the raw
+                    // 0x13889C frame tick), dump the next COUNT gfx-task snapshots numbered _taskNN.bin
+                    // (several gfx tasks per frame). Pick the one matching the golden offline.
+                    static bool s_armed = false; static int s_dumped = 0;
+                    const uint8_t* snap = task_action->snapshot;
+                    const uint32_t fc = *reinterpret_cast<const uint32_t*>(snap + 0x13889C);
+                    if (!s_armed) {
+                        if (s_dump_iter >= 0 && rs64_cine_iter_get() >= (unsigned long long)s_dump_iter) s_armed = true;
+                        else if (s_dump_ovl >= 0 && g_active_overlay == (int)s_dump_ovl) s_armed = true;
+                    }
+                    if (s_armed && s_dumped < s_dump_cnt) {
+                        const char* path = std::getenv("ROGUESQ_DUMP_PARSE_SNAPSHOT_PATH");
+                        const char* base = (path && *path) ? path : "parse_snapshot";
+                        char fn[1024]; snprintf(fn, sizeof(fn), "%s_task%02d.bin", base, s_dumped);
+                        if (FILE* f = fopen(fn, "wb")) {
+                            static uint8_t obuf[0x800000];
+                            for (uint32_t i = 0; i < 0x800000u; ++i) obuf[i] = snap[i ^ 3];
+                            fwrite(obuf, 1, sizeof(obuf), f); fclose(f);
+                            fprintf(stderr, "[parse-snapshot] task%02d fc=%u dl=0x%08X -> %s\n", s_dumped, fc, (uint32_t)displaylist, fn); fflush(stderr);
+                        }
+                        ++s_dumped;
+                    }
+                }
                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
 
+                if (s_sp_after) sp_complete();
                 dp_complete();
+                { std::lock_guard<std::mutex> plock{ g_gfx_parse_mutex }; if (g_gfx_parse_inflight.load(std::memory_order_acquire) > 0) g_gfx_parse_inflight.fetch_sub(1, std::memory_order_acq_rel); }
+                g_gfx_parse_cv.notify_all();
+                if (s_log_task) { fprintf(stderr, "[gfx-task #%u] done sp+dp signaled parse=%lld us pdl=%lld us hops=%u faces=%u req=%u inflight=%d\n", s_task_n, (long long)std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count(), g_rs64_pdl_us, g_f5_task_hops, g_f5_task_faces, g_rs64_gfx_requests, g_gfx_parse_inflight.load(std::memory_order_acquire)); fflush(stderr); }
+                if (gfx_sync_submit_enabled()) g_gfx_task_parsed.signal();   // ROGUESQ_GFX_SYNC_SUBMIT
                 // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
                 ultramodern::extensions::on_displaylist_parsed(displaylist);
                 ultramodern::extensions::on_displaylist_completed(displaylist);
@@ -566,6 +790,13 @@ extern "C" PTR(void) osViGetCurrentFramebuffer() {
     return events_context.vi.get_cur_state()->framebuffer;
 }
 
+static bool gfx_sync_submit_enabled() {
+    static int s = -1;
+    if (s < 0) { const char* e = std::getenv("ROGUESQ_GFX_SYNC_SUBMIT"); s = (e && *e && *e != '0') ? 1 : 0; }
+    return s == 1;
+}
+moodycamel::LightweightSemaphore g_gfx_task_parsed;
+
 void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     OSTask* task = TO_PTR(OSTask, task_);
 
@@ -574,9 +805,19 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     // processDisplayLists(isHLE=true). Non-GFX tasks (audio, etc.) still go
     // to sp_task_queue → task_thread_func → rsp::run_task (LLE).
     if (task->t.type == M_GFXTASK) {
-        events_context.action_queue.enqueue(SpTaskAction{ *task });
+        events_context.action_queue.enqueue(SpTaskAction{ *task, parse_snapshot_enabled() ? take_rdram_snapshot(rdram) : nullptr });
+        // RogueSquadron64Recomp (2026-09-07): ROGUESQ_GFX_SYNC_SUBMIT=1 waits until the gfx thread has
+        // parsed this list (send_dl + dp_complete). On hardware the RSP consumes the list before the game
+        // can recycle its DL chunks; otherwise the game thread runs ahead and reuses chunks the HLE is
+        // still walking (phantom commands, garbage SETCIMG, fb-registry crash). Experiment.
+        if (gfx_sync_submit_enabled()) g_gfx_task_parsed.wait();
     }
     else {
+        // Track in-flight async audio synth tasks so osAiSetNextBuffer can wait
+        // for the output buffer to be filled before the game plays it.
+        if (audio_async_enabled() && task->t.type == M_AUDTASK) {
+            g_pending_audio_synth.fetch_add(1, std::memory_order_acq_rel);
+        }
         events_context.sp_task_queue.enqueue(task);
     }
 }
@@ -632,6 +873,7 @@ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle wind
     events_context.vi.states[1].mode = &dummy_mode;
 
     events_context.vi.thread = std::thread{ vi_thread_func };
+    if (ai_consumption_paced()) { static std::thread s_ai_thread{ ai_thread_func }; s_ai_thread.detach(); }
 }
 
 void ultramodern::join_event_threads() {
