@@ -1,7 +1,12 @@
 #include "ultramodern/ultramodern.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+static bool rs64_sched_log() { static const bool on = std::getenv("ROGUESQ_LOG_SCHED") != nullptr; return on; }
+
 void ultramodern::schedule_running_thread(RDRAM_ARG PTR(OSThread) t_) {
     debug_printf("[Scheduling] Adding thread %d to the running queue\n", TO_PTR(OSThread, t_)->id);
+    if (rs64_sched_log()) { std::fprintf(stderr, "[sched] queue+ id=%d pri=%d\n", TO_PTR(OSThread, t_)->id, TO_PTR(OSThread, t_)->priority); std::fflush(stderr); }
     thread_queue_insert(PASS_RDRAM running_queue, t_);
     TO_PTR(OSThread, t_)->state = OSThreadState::QUEUED;
 }
@@ -21,6 +26,7 @@ void ultramodern::check_running_queue(RDRAM_ARG1) {
         // Check if the highest priority thread in the queue is higher priority than the current thread.
         OSThread* next_thread = TO_PTR(OSThread, ultramodern::thread_queue_peek(PASS_RDRAM running_queue));
         OSThread* self = TO_PTR(OSThread, ultramodern::this_thread());
+        if (rs64_sched_log()) { std::fprintf(stderr, "[sched] check self id=%d pri=%d | next id=%d pri=%d | swap=%d\n", self->id, self->priority, next_thread->id, next_thread->priority, (int)(next_thread->priority > self->priority)); std::fflush(stderr); }
         if (next_thread->priority > self->priority) {
             ultramodern::thread_queue_pop(PASS_RDRAM running_queue);
             // Swap to the higher priority thread.

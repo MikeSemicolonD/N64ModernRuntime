@@ -1,27 +1,12 @@
 #include <memory>
-#include <thread>
-#include <cstdio>
 #include <cstdlib>
+#include <cstdio>
 #include <ultramodern/ultra64.h>
 #include <ultramodern/ultramodern.hpp>
 #include "recomp.h"
-
-namespace {
-    // Cached env-var read for the thread-lifecycle log gate. Returns true
-    // iff ROGUESQ_LOG_THREAD_LIFECYCLE (or ROGUESQ_LOG_ALL) is set non-zero.
-    // Each [DEBUG] osCreateThread/osStartThread line is silenced by default
-    // because they fire 30+ times at startup and add no value to a healthy
-    // run; enable when debugging the thread system bringup or scheduler.
-    bool log_thread_lifecycle() {
-        static const bool v = []{
-            const char *a = std::getenv("ROGUESQ_LOG_ALL");
-            if (a && *a && *a != '0') return true;
-            const char *e = std::getenv("ROGUESQ_LOG_THREAD_LIFECYCLE");
-            return e && *e && *e != '0';
-        }();
-        return v;
-    }
-}
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 extern "C" void osInitialize_recomp(uint8_t * rdram, recomp_context * ctx) {
     osInitialize();
@@ -88,7 +73,18 @@ extern "C" void osCreateMesgQueue_recomp(uint8_t* rdram, recomp_context* ctx) {
 }
 
 extern "C" void osRecvMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
+    // ROGUESQ_LOG_RECV=1: trace BLOCKING recvs so a boot hang can be pinned to the
+    // exact queue+thread it's stuck on (last ENTER with no matching RETURN).
+    static int s_log = -1;
+    if (s_log < 0) { const char* e = std::getenv("ROGUESQ_LOG_RECV"); s_log = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    const bool blk = s_log && ((s32)ctx->r6 != 0);
+#ifdef _WIN32
+    if (blk) { fprintf(stderr, "[recv ENTER] q=0x%08X tid=%lu\n", (unsigned)ctx->r4, (unsigned long)GetCurrentThreadId()); fflush(stderr); }
+#endif
     ctx->r2 = osRecvMesg(rdram, (int32_t)ctx->r4, (int32_t)ctx->r5, (s32)ctx->r6);
+#ifdef _WIN32
+    if (blk) { fprintf(stderr, "[recv RETURN] q=0x%08X tid=%lu\n", (unsigned)ctx->r4, (unsigned long)GetCurrentThreadId()); fflush(stderr); }
+#endif
 }
 
 extern "C" void osSendMesg_recomp(uint8_t* rdram, recomp_context* ctx) {

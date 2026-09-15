@@ -126,6 +126,10 @@ void init_audio();
 void set_audio_frequency(uint32_t freq);
 void queue_audio_buffer(RDRAM_ARG PTR(s16) audio_data, uint32_t byte_count);
 uint32_t get_remaining_audio_bytes();
+// Blocks until all in-flight async audio (M_AUDTASK) synth tasks have finished
+// writing their output buffers. No-op unless ROGUESQ_AUDIO_ASYNC is enabled.
+// Called from osAiSetNextBuffer so the game never reads a half-synthesized buffer.
+void wait_for_pending_audio_synth();
 
 struct audio_callbacks_t {
     using queue_samples_t = void(int16_t*, size_t);

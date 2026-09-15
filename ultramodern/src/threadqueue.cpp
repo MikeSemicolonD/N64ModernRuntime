@@ -43,14 +43,16 @@ PTR(OSThread) ultramodern::thread_queue_pop(RDRAM_ARG PTR(PTR(OSThread)) queue_)
 bool ultramodern::thread_queue_remove(RDRAM_ARG PTR(PTR(OSThread)) queue_, PTR(OSThread) t_) {
     debug_printf("[Thread Queue] Removing thread %d from queue 0x%08X\n", TO_PTR(OSThread, t_)->id, (uintptr_t)queue_);
 
-    PTR(PTR(OSThread)) cur = queue_;
-    while (cur != NULLPTR) {
-        PTR(OSThread)* cur_ptr = queue_to_ptr(PASS_RDRAM queue_);
+    // Walk via pointer-to-next so a thread at ANY position is removed, not just the head:
+    // the old loop recomputed cur_ptr from queue_ (the head slot) each iteration, so destroying
+    // a non-head thread left a null-context zombie in the queue (run_next_thread crash/freeze).
+    PTR(OSThread)* cur_ptr = queue_to_ptr(PASS_RDRAM queue_);
+    while (*cur_ptr != NULLPTR) {
         if (*cur_ptr == t_) {
             *cur_ptr = TO_PTR(OSThread, *cur_ptr)->next;
             return true;
         }
-        cur = TO_PTR(OSThread, *cur_ptr)->next;
+        cur_ptr = &TO_PTR(OSThread, *cur_ptr)->next;
     }
 
     return false;

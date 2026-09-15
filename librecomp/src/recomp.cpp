@@ -475,42 +475,47 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
     }
 
     recomp_func_t* func = get_function(addr);
-    {
-        // Per-thread "starting" log — fires once per recompiled thread that
-        // actually begins executing. Useful for thread-system bringup, but
-        // adds 15-20 lines at startup. ROGUESQ_LOG_THREAD_LIFECYCLE=1.
-        static const bool log_t = []{
-            const char *a = std::getenv("ROGUESQ_LOG_ALL");
-            if (a && *a && *a != '0') return true;
-            const char *e = std::getenv("ROGUESQ_LOG_THREAD_LIFECYCLE");
-            return e && *e && *e != '0';
-        }();
-        if (log_t) {
-            printf("[DEBUG] thread 0x%08llX starting\n", (unsigned long long)addr); fflush(stdout);
-        }
-    }
 #ifdef _WIN32
-    // Let C++ exceptions (0xE06D7363) propagate so the outer try/catch in
-    // threads.cpp can capture e.what(). Hardware SEH exceptions (AVs etc.)
-    // also propagate — main.cpp's SetUnhandledExceptionFilter writes a
-    // minidump and a symbolicated stack before the OS terminates the process.
-    // (Earlier code caught hardware exceptions here and called std::exit(1),
-    // which both lost the dump and triggered std::terminate via the
-    // thread_cleaner_thread static destructor.)
+    // SEH wrapper — Factor 5's cinematic walks uninitialized linked-list
+    // tables that randomly produce wild pointer dereferences in different
+    // funcs each run. Catching the AV here lets the thread exit cleanly
+    // and the rest of the system (audio, VI, main thread) keeps running.
+    // Logs the AV target address + faulting instruction PC + a few stack
+    // frames so we can identify which recompiled function triggered it.
+    uintptr_t av_target = 0;
+    uintptr_t av_pc = 0;
+    DWORD av_code = 0;
+    ULONG_PTR av_kind = 0;  // 0=read, 1=write, 8=execute(DEP)
+    void* av_frames[8] = {};
+    USHORT av_frame_count = 0;
     __try {
         func(rdram, &ctx);
-    } __except(GetExceptionCode() == 0xE06D7363
-               ? EXCEPTION_CONTINUE_SEARCH
-               : (printf("[CRASH] thread 0x%08llX exception 0x%08lX\n",
-                         (unsigned long long)addr, GetExceptionCode()),
-                  fflush(stdout),
-                  EXCEPTION_CONTINUE_SEARCH)) {
-        // Unreachable — both paths return EXCEPTION_CONTINUE_SEARCH.
+    }
+    __except (
+        av_kind = GetExceptionInformation()->ExceptionRecord->ExceptionInformation[0],
+        av_target = (uintptr_t)GetExceptionInformation()->ExceptionRecord->ExceptionInformation[1],
+        av_pc = (uintptr_t)GetExceptionInformation()->ExceptionRecord->ExceptionAddress,
+        av_code = GetExceptionInformation()->ExceptionRecord->ExceptionCode,
+        av_frame_count = RtlCaptureStackBackTrace(0, 8, av_frames, NULL),
+        EXCEPTION_EXECUTE_HANDLER
+    ) {
+        const char* kind_str = (av_kind == 0) ? "READ" : (av_kind == 1) ? "WRITE" : (av_kind == 8) ? "EXEC" : "?";
+        // Module base, so the av_pc / frames can be resolved to RVAs despite
+        // ASLR (tools/resolve-rva.ps1 expects RVAs, not absolute addresses).
+        uintptr_t mod_base = (uintptr_t)GetModuleHandleW(NULL);
+        fprintf(stderr, "[recomp] SEH caught: thread_entry=0x%08X code=0x%08X kind=%s av_target=0x%p av_pc=0x%p av_rva=0x%llX\n",
+                (uint32_t)addr, (unsigned)av_code, kind_str, (void*)av_target, (void*)av_pc,
+                (unsigned long long)(av_pc - mod_base));
+        fprintf(stderr, "[recomp]   call stack RVAs (%u frames):", (unsigned)av_frame_count);
+        for (USHORT i = 0; i < av_frame_count; i++) {
+            fprintf(stderr, " 0x%llX", (unsigned long long)((uintptr_t)av_frames[i] - mod_base));
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
     }
 #else
     func(rdram, &ctx);
 #endif
-    printf("[DEBUG] thread 0x%08llX exited\n", (unsigned long long)addr); fflush(stdout);
 }
 
 void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
