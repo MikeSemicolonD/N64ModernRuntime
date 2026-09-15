@@ -389,6 +389,8 @@ void sp_complete() {
 void dp_complete() {
     uint8_t* rdram = events_context.rdram;
     std::lock_guard lock{ events_context.message_mutex };
+    static const bool s_lfq = [](){ const char* e = std::getenv("ROGUESQ_LOG_FRAMEQ"); return e && *e && *e != '0'; }();
+    if (s_lfq) { static unsigned n = 0; fprintf(stderr, "[frameq] dp_complete #%u -> mq=0x%06X\n", ++n, (uint32_t)events_context.dp.mq & 0xFFFFFFu); fflush(stderr); }
     ultramodern::enqueue_external_message_src(events_context.dp.mq, events_context.dp.msg, false, ultramodern::EventMessageSource::Dp);
 }
 

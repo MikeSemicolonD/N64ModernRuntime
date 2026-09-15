@@ -89,11 +89,25 @@ s32 MQ_IS_FULL(OSMesgQueue* mq) {
     return MQ_GET_COUNT(mq) >= mq->msgCount;
 }
 
+// ROGUESQ_LOG_FRAMEQ=1: trace sends/wakes on the frame-completion / DP-pacing queues
+// (0x8011A818 submitGfxFrame wait, 0x8011A408 DP gate, 0x8011A7E8 consumer) to catch a
+// completion that is produced but never delivered/woken (the hangar park).
+static bool rs64_frameq_log() {
+    static const bool on = [](){ const char* e = std::getenv("ROGUESQ_LOG_FRAMEQ"); return e && *e && *e != '0'; }();
+    return on;
+}
+static bool rs64_is_frameq(PTR(OSMesgQueue) mq_) {
+    const uint32_t a = (uint32_t)mq_ & 0x00FFFFFFu;
+    return a == 0x11A818u || a == 0x11A408u || a == 0x11A7E8u || a == 0x114388u || a == 0x128CF0u || a == 0x128D10u || a == 0x11A420u;
+}
+
 bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
     OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
+    const bool fqlog = rs64_frameq_log() && rs64_is_frameq(mq_);
     if (!block) {
         // If non-blocking, fail if the queue is full.
         if (MQ_IS_FULL(mq)) {
+            if (fqlog) { std::fprintf(stderr, "[frameq] send FULL q=0x%06X valid=%d\n", (uint32_t)mq_ & 0xFFFFFFu, mq->validCount); std::fflush(stderr); }
             return false;
         }
     }
@@ -121,15 +135,19 @@ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block) {
 
     // If any threads were blocked on receiving from this message queue, pop the first one and schedule it.
     PTR(PTR(OSThread)) blocked_queue = GET_MEMBER(OSMesgQueue, mq_, blocked_on_recv);
-    if (!ultramodern::thread_queue_empty(PASS_RDRAM blocked_queue)) {
+    const bool woke = !ultramodern::thread_queue_empty(PASS_RDRAM blocked_queue);
+    if (woke) {
         ultramodern::schedule_running_thread(PASS_RDRAM ultramodern::thread_queue_pop(PASS_RDRAM blocked_queue));
     }
-    
+    if (fqlog) { std::fprintf(stderr, "[frameq] send OK q=0x%06X valid=%d woke=%d\n", (uint32_t)mq_ & 0xFFFFFFu, mq->validCount, (int)woke); std::fflush(stderr); }
+
     return true;
 }
 
 bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
     OSMesgQueue* mq = TO_PTR(OSMesgQueue, mq_);
+    const bool fqlog = rs64_frameq_log() && rs64_is_frameq(mq_);
+    if (fqlog) { std::fprintf(stderr, "[frameq] recv q=0x%06X valid=%d block=%d%s\n", (uint32_t)mq_ & 0xFFFFFFu, mq->validCount, (int)block, (block && MQ_IS_EMPTY(mq)) ? " -> WILL BLOCK" : ""); std::fflush(stderr); }
     if (!block) {
         // If non-blocking, fail if the queue is empty
         if (MQ_IS_EMPTY(mq)) {
