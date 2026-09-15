@@ -248,7 +248,6 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
     if (!block) {
         // If non-blocking, fail if the queue is empty
         if (MQ_IS_EMPTY(mq)) {
-            if (is_focus_mq((uint32_t)mq_)) mqfocus_log("recv-empty", (uint32_t)mq_, mq, block, 0);
             return false;
         }
     } else {

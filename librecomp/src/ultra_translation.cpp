@@ -8,6 +8,12 @@
 #include <windows.h>
 #endif
 
+// ROGUESQ_LOG_THREADS=1: thread create/start/destroy trace.
+static bool log_thread_lifecycle() {
+    static const int on = []() { const char* e = std::getenv("ROGUESQ_LOG_THREADS"); return (e && e[0] && e[0] != (char)48) ? 1 : 0; }();
+    return on != 0;
+}
+
 extern "C" void osInitialize_recomp(uint8_t * rdram, recomp_context * ctx) {
     osInitialize();
 }

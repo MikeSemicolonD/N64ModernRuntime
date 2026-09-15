@@ -111,23 +111,25 @@ void rsp_dpc_submit(uint8_t* rdram, uint32_t start, uint32_t end);
 #define RSP_DPC_CURRENT_READ()     (g_rsp_dpc_end ? g_rsp_dpc_end : 0xFFFFFFFFu)
 #define RSP_DPC_END_READ()         (g_rsp_dpc_end)
 
-// Bounded DMA: clamp lengths/addresses so a graphics ucode that runs with
-// uninitialized GPRs (e.g. before its bootloader has set them up) skips bogus
-// DMAs instead of access-violating. Real RSP behavior would mask, so this
-// matches hardware better than crashing anyway.
+// SP_MEM_ADDR bit 12 selects IMEM over DMEM; bits 0-11 are the offset, and a transfer wraps
+// within its 4 KB bank. A recompiled ucode never executes IMEM (its code is compiled in), so an
+// IMEM-targeted transfer is a no-op -- that is how a bootloader loads its own text (Factor 5 boot
+// DMAs 0xF80 bytes to 0x1080 = IMEM+0x80, then jumps there).
+#define RSP_MEM_ADDR_IMEM 0x1000u
+
 static inline void dma_rdram_to_dmem(uint8_t* rdram, uint32_t dmem_addr, uint32_t dram_addr, uint32_t rd_len) {
-    rd_len += 1; // Read length is inclusive
+    if (dmem_addr & RSP_MEM_ADDR_IMEM) return;
+    rd_len = (rd_len & 0xFFF) + 1; // Read length is inclusive
     dram_addr &= 0xFFFFF8;
-    assert(dmem_addr + rd_len <= 0x1000);
     for (uint32_t i = 0; i < rd_len; i++) {
         RSP_MEM_B(i, dmem_addr) = MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000));
     }
 }
 
 static inline void dma_dmem_to_rdram(uint8_t* rdram, uint32_t dmem_addr, uint32_t dram_addr, uint32_t wr_len) {
-    wr_len += 1; // Write length is inclusive
+    if (dmem_addr & RSP_MEM_ADDR_IMEM) return;
+    wr_len = (wr_len & 0xFFF) + 1; // Write length is inclusive
     dram_addr &= 0xFFFFF8;
-    assert(dmem_addr + wr_len <= 0x1000);
     for (uint32_t i = 0; i < wr_len; i++) {
         MEM_B(0, (int64_t)(int32_t)(dram_addr + i + 0x80000000)) = RSP_MEM_B(i, dmem_addr);
     }
