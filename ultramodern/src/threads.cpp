@@ -12,6 +12,7 @@
 // Native APIs only used to set thread names for easier debugging
 #ifdef _WIN32
 #include <Windows.h>
+#include <process.h>   // _endthreadex
 #endif
 
 static ultramodern::threads::callbacks_t threads_callbacks;
@@ -173,16 +174,23 @@ void ultramodern::set_native_thread_name(const std::string& name) {
 void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
 #endif
 
+[[noreturn]] static void end_deleted_thread(UltraThreadContext* cur_context);
+
 void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
     if (thread_context == nullptr) {
         printf("[CRASH] wait_for_resumed called with NULL context! thread_self=0x%08X\n", (uint32_t)ultramodern::this_thread()); fflush(stdout);
         std::abort();
     }
     thread_context->running.wait();
-    // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
-    // This will trigger thread cleanup instead.
+    // If this thread's context was replaced/deleted by another thread destroying
+    // us, terminate this host thread directly. The old path called
+    // osDestroyThread(NULL), which throws thread_terminated to unwind out to
+    // _thread_func's catch; in optimized Release that unwind fails to traverse the
+    // recompiled frames and escapes to std::terminate (the medal / level-complete
+    // abort). The destroying thread already rescheduled, so no run_next_thread is
+    // owed here — just clean up and exit, matching _thread_func's deleted tail.
     if (TO_PTR(OSThread, ultramodern::this_thread())->context != thread_context) {
-        osDestroyThread(PASS_RDRAM NULLPTR);
+        end_deleted_thread(thread_context);
     }
 }
 
@@ -269,6 +277,18 @@ void run_next_thread(RDRAM_ARG1) {
     OSThread* to_run = TO_PTR(OSThread, ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue));
     debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
     to_run->context->running.signal();
+}
+
+// Enqueue this thread's context for the cleaner (which joins this host thread)
+// and exit it, matching _thread_func's deleted-context tail. See wait_for_resumed.
+[[noreturn]] static void end_deleted_thread(UltraThreadContext* cur_context) {
+    ultramodern::cleanup_thread(cur_context);
+#ifdef _WIN32
+    _endthreadex(0);
+#else
+    pthread_exit(nullptr);
+#endif
+    std::abort(); // unreachable
 }
 
 void ultramodern::run_next_thread_and_wait(RDRAM_ARG1) {
