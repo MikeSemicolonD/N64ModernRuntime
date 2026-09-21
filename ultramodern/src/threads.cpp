@@ -268,8 +268,6 @@ void run_next_thread(RDRAM_ARG1) {
 
     OSThread* to_run = TO_PTR(OSThread, ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue));
     debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
-    { static const bool s_log = std::getenv("ROGUESQ_LOG_SCHED") != nullptr;
-      if (s_log) { std::fprintf(stderr, "[sched] run_next resume id=%d pri=%d\n", to_run->id, to_run->priority); std::fflush(stderr); } }
     to_run->context->running.signal();
 }
 

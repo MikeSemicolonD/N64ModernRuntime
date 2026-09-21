@@ -80,7 +80,10 @@ static bool parse_snapshot_enabled() {
     static const bool on = [](){ const char* e = std::getenv("ROGUESQ_PARSE_SNAPSHOT"); return !(e && e[0] == '0'); }();
     return on;
 }
+// ROGUESQ_LOG_FRAME_PROFILE: last snapshot memcpy duration (us), sampled by the hitch report.
+extern "C" volatile long long g_rs64_snap_us; volatile long long g_rs64_snap_us = 0;
 static uint8_t* take_rdram_snapshot(const uint8_t* rdram) {
+    const auto snap0 = std::chrono::high_resolution_clock::now();
     // RT64's F5 GBI writes scratch (vertices @0xA00000, viewport @0xA01000) ABOVE the 8 MB game RAM, and
     // reads/writes it through state->RDRAM (= this buffer during the parse). An 8 MB buffer sends those
     // writes ~2 MB out of bounds -> heap corruption / AVs in f5_set_viewport (the in-mission instability).
@@ -91,6 +94,8 @@ static uint8_t* take_rdram_snapshot(const uint8_t* rdram) {
     uint8_t*& b = bufs[next++ % 3];
     if (!b) { b = static_cast<uint8_t*>(std::malloc(kSnapSize)); if (b) std::memset(b, 0, kSnapSize); }
     if (b) std::memcpy(b, rdram, 0x800000);
+    g_rs64_snap_us = (long long)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now() - snap0).count();
     return b;
 }
 extern "C" uint8_t* g_rs64_parse_rdram = nullptr;   // read by send_dl: parse input when non-null
@@ -649,11 +654,10 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 // RogueSquadron64Recomp (2026-09-09): dump the EXACT snapshot the parser just walked, so
                 // tools/validate/f5_dl_walk.py sees the parser-visible DL, not live RDRAM (which races with
                 // post-parse chunk recycling). Anchored to the cinematic frame counter (RDRAM 0x13889C);
-                // written big-endian (i^3) once. ROGUESQ_DUMP_PARSE_SNAPSHOT_ON_FC=<n> [+ _PATH].
+                // written big-endian (i^3) once. ROGUESQ_DUMP_PARSE_SNAPSHOT_ON_ITER=<n> [+ _PATH].
                 static const long s_dump_iter = [](){ const char* e = std::getenv("ROGUESQ_DUMP_PARSE_SNAPSHOT_ON_ITER"); return (e && *e) ? std::atol(e) : -1L; }();
-                static const long s_dump_ovl = [](){ const char* e = std::getenv("ROGUESQ_DUMP_PARSE_SNAPSHOT_ON_OVERLAY"); return (e && *e) ? std::atol(e) : -1L; }();
                 static const int s_dump_cnt = [](){ const char* e = std::getenv("ROGUESQ_DUMP_PARSE_SNAPSHOT_COUNT"); return (e && *e) ? std::atoi(e) : 1; }();
-                if ((s_dump_iter >= 0 || s_dump_ovl >= 0) && task_action->snapshot) {
+                if (s_dump_iter >= 0 && task_action->snapshot) {
                     // Once the cinematic-loop iteration reaches the target (the SAME landmark as
                     // ROGUESQ_DUMP_RDRAM_ON_CINE_ITER and the PJ64 cine_frame<n> goldens - NOT the raw
                     // 0x13889C frame tick), dump the next COUNT gfx-task snapshots numbered _taskNN.bin
@@ -663,7 +667,6 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                     const uint32_t fc = *reinterpret_cast<const uint32_t*>(snap + 0x13889C);
                     if (!s_armed) {
                         if (s_dump_iter >= 0 && rs64_cine_iter_get() >= (unsigned long long)s_dump_iter) s_armed = true;
-                        else if (s_dump_ovl >= 0 && g_active_overlay == (int)s_dump_ovl) s_armed = true;
                     }
                     if (s_armed && s_dumped < s_dump_cnt) {
                         const char* path = std::getenv("ROGUESQ_DUMP_PARSE_SNAPSHOT_PATH");

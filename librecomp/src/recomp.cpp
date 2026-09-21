@@ -460,6 +460,21 @@ extern "C" void do_break(uint32_t vram) {
 std::optional<std::u8string> current_game = std::nullopt;
 std::atomic<GameStatus> game_status = GameStatus::None;
 
+// osDestroyThread throws ultramodern::thread_terminated when a thread ends itself;
+// it must be swallowed so only that one thread unwinds. Catch it in the same frame
+// that invokes the recompiled function: under /O2 the throw did not reliably
+// propagate across run_thread_function's SEH (__try) frame to the catch in
+// _thread_func, so it reached std::terminate and aborted the process (the
+// Release-only crash on the medal / level-complete thread teardown). A plain C++
+// try/catch here (no SEH between throw and catch) is optimizer-safe.
+static void invoke_recomp_func(recomp_func_t* func, uint8_t* rdram, recomp_context* ctx) {
+    try {
+        func(rdram, ctx);
+    } catch (ultramodern::thread_terminated&) {
+        // Thread requested its own termination; unwound cleanly, now return.
+    }
+}
+
 void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t arg) {
     auto find_it = game_roms.find(current_game.value());
     const recomp::GameEntry& game_entry = find_it->second;
@@ -489,7 +504,7 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
     void* av_frames[8] = {};
     USHORT av_frame_count = 0;
     __try {
-        func(rdram, &ctx);
+        invoke_recomp_func(func, rdram, &ctx);
     }
     __except (
         av_code = GetExceptionInformation()->ExceptionRecord->ExceptionCode,
@@ -518,7 +533,7 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
         fflush(stderr);
     }
 #else
-    func(rdram, &ctx);
+    invoke_recomp_func(func, rdram, &ctx);
 #endif
 }
 
