@@ -492,12 +492,16 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
         func(rdram, &ctx);
     }
     __except (
-        av_kind = GetExceptionInformation()->ExceptionRecord->ExceptionInformation[0],
-        av_target = (uintptr_t)GetExceptionInformation()->ExceptionRecord->ExceptionInformation[1],
-        av_pc = (uintptr_t)GetExceptionInformation()->ExceptionRecord->ExceptionAddress,
         av_code = GetExceptionInformation()->ExceptionRecord->ExceptionCode,
-        av_frame_count = RtlCaptureStackBackTrace(0, 8, av_frames, NULL),
-        EXCEPTION_EXECUTE_HANDLER
+        // 0xE06D7363 = MSVC C++ throw (ultramodern::thread_terminated, std::exception).
+        // Must propagate to the catch in threads.cpp; only hardware faults are handled here.
+        (av_code == 0xE06D7363)
+            ? EXCEPTION_CONTINUE_SEARCH
+            : ( av_kind = GetExceptionInformation()->ExceptionRecord->ExceptionInformation[0],
+                av_target = (uintptr_t)GetExceptionInformation()->ExceptionRecord->ExceptionInformation[1],
+                av_pc = (uintptr_t)GetExceptionInformation()->ExceptionRecord->ExceptionAddress,
+                av_frame_count = RtlCaptureStackBackTrace(0, 8, av_frames, NULL),
+                EXCEPTION_EXECUTE_HANDLER )
     ) {
         const char* kind_str = (av_kind == 0) ? "READ" : (av_kind == 1) ? "WRITE" : (av_kind == 8) ? "EXEC" : "?";
         // Module base, so the av_pc / frames can be resolved to RVAs despite
@@ -638,6 +642,11 @@ std::string recomp::mods::get_mod_id_from_filename(const std::filesystem::path& 
 std::filesystem::path recomp::mods::get_mod_filename(const std::string& mod_id) {
     std::lock_guard lock { mod_context_mutex };
     return mod_context->get_mod_filename(mod_id);
+}
+
+recomp_func_t* recomp::mods::get_mod_export(const std::string& mod_id, const std::string& export_name) {
+    std::lock_guard lock { mod_context_mutex };
+    return mod_context->get_mod_export(mod_id, export_name);
 }
 
 size_t recomp::mods::get_mod_order_index(const std::string& mod_id) {

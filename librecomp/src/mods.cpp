@@ -2,6 +2,7 @@
 #include <fstream>
 #include <sstream>
 #include <functional>
+#include <algorithm>
 
 #include "librecomp/files.hpp"
 #include "librecomp/mods.hpp"
@@ -99,7 +100,13 @@ public:
     static constexpr std::string_view PlatformExtension = ".dll";
     DynamicLibrary() = default;
     DynamicLibrary(const std::filesystem::path& path) {
-        native_handle = LoadLibraryExW(std::filesystem::absolute(path).c_str(), nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR);
+        std::filesystem::path abs = std::filesystem::absolute(path);
+        native_handle = LoadLibraryExW(abs.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR);
+        if (native_handle == nullptr) {
+            fprintf(stderr, "[mods] LoadLibraryExW failed (err=%lu) for %ls\n",
+                (unsigned long)GetLastError(), abs.c_str());
+            fflush(stderr);
+        }
 
         if (good()) {
             uint32_t* recomp_api_version;
@@ -307,7 +314,12 @@ void recomp::mods::ModHandle::populate_exports() {
 
 recomp::mods::CodeModLoadError recomp::mods::ModHandle::load_native_library(const recomp::mods::NativeLibraryManifest& lib_manifest, std::string& error_param) {
     std::string lib_filename = lib_manifest.name + std::string{DynamicLibrary::PlatformExtension};
-    std::filesystem::path lib_path = manifest.mod_root_path.parent_path() / lib_filename;
+    // mod_root_path is the mod folder for a folder mod, or the archive file for an
+    // archive mod; the native library lives beside the manifest either way.
+    std::filesystem::path base = std::filesystem::is_directory(manifest.mod_root_path)
+        ? manifest.mod_root_path
+        : manifest.mod_root_path.parent_path();
+    std::filesystem::path lib_path = base / lib_filename;
 
     std::unique_ptr<DynamicLibrary>& lib = native_libraries.emplace_back(std::make_unique<DynamicLibrary>(lib_path));
 
@@ -1190,6 +1202,21 @@ std::filesystem::path recomp::mods::ModContext::get_mod_filename(const std::stri
     return opened_mods[find_it->second].manifest.mod_root_path;
 }
 
+recomp_func_t* recomp::mods::ModContext::get_mod_export(const std::string& mod_id, const std::string& export_name) const {
+    auto find_it = opened_mods_by_id.find(mod_id);
+    if (find_it == opened_mods_by_id.end()) {
+        return nullptr;
+    }
+    GenericFunction gf;
+    if (!opened_mods[find_it->second].get_export_function(export_name, gf)) {
+        return nullptr;
+    }
+    if (auto* p = std::get_if<recomp_func_t*>(&gf)) {
+        return *p;
+    }
+    return nullptr;
+}
+
 size_t recomp::mods::ModContext::get_mod_order_index(const std::string& mod_id) const {
     auto find_it = opened_mods_by_id.find(mod_id);
     if (find_it == opened_mods_by_id.end()) {
@@ -1708,6 +1735,27 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
             load_address += cur_ram_used;
             ram_used += cur_ram_used;
             base_event_indices[mod_index] = static_cast<uint32_t>(base_event_index);
+        }
+    }
+
+    // Load native libraries for enabled data-only mods (no recompiled code). Code
+    // mods already loaded theirs in init_mod_code; a mod may ship only a native
+    // library (e.g. to provide host-side menu button behaviors), which otherwise
+    // never gets loaded.
+    for (size_t mod_index : active_mods) {
+        auto& mod = opened_mods[mod_index];
+        if (mod.manifest.native_libraries.empty()) continue;
+        if (std::find(loaded_code_mods.begin(), loaded_code_mods.end(), mod_index) != loaded_code_mods.end()) continue;
+        std::string cur_error_param;
+        for (const recomp::mods::NativeLibraryManifest& cur_lib_manifest : mod.manifest.native_libraries) {
+            CodeModLoadError cur_error = mod.load_native_library(cur_lib_manifest, cur_error_param);
+            if (cur_error != CodeModLoadError::Good) {
+                // Non-fatal: a data-only mod's optional native library failing must
+                // not break mod loading (its @export behaviors just won't resolve).
+                fprintf(stderr, "[mods] native library load failed for %s: %s\n",
+                    mod.manifest.mod_id.c_str(),
+                    (error_to_string(cur_error) + (cur_error_param.empty() ? "" : ":" + cur_error_param)).c_str());
+            }
         }
     }
 

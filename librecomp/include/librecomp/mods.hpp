@@ -362,6 +362,9 @@ namespace recomp {
             void unload_mods();
             std::string get_mod_id_from_filename(const std::filesystem::path& mod_filename) const;
             std::filesystem::path get_mod_filename(const std::string& mod_id) const;
+            // Resolve a named export (code or native library) of a loaded mod to a
+            // callable recomp function, or nullptr if the mod/export isn't found.
+            recomp_func_t* get_mod_export(const std::string& mod_id, const std::string& export_name) const;
             size_t get_mod_order_index(const std::string& mod_id) const;
             size_t get_mod_order_index(size_t mod_index) const;
             std::optional<ModDetails> get_details_for_mod(const std::string& mod_id) const;
@@ -640,6 +643,7 @@ namespace recomp {
         ConfigValueVariant get_mod_config_value(const std::string &mod_id, const std::string &option_id);
         std::string get_mod_id_from_filename(const std::filesystem::path& mod_filename);
         std::filesystem::path get_mod_filename(const std::string& mod_id);
+        recomp_func_t* get_mod_export(const std::string& mod_id, const std::string& export_name);
         size_t get_mod_order_index(const std::string& mod_id);
         size_t get_mod_order_index(size_t mod_index);
         ModContentTypeId register_mod_content_type(const ModContentType& type);
