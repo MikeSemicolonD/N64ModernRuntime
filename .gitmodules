@@ -4,9 +4,21 @@
 [submodule "thirdparty/miniz"]
 	path = thirdparty/miniz
 	url = https://github.com/richgel999/miniz
-[submodule "N64Recomp"]
-	path = N64Recomp
-	url = https://github.com/MikeSemicolonD/N64Recomp.git
 [submodule "thirdparty/o1heap"]
 	path = thirdparty/o1heap
 	url = https://github.com/N64Recomp/o1heap
+[submodule "N64Recomp/lib/ELFIO"]
+	path = N64Recomp/lib/ELFIO
+	url = https://github.com/serge1/ELFIO
+[submodule "N64Recomp/lib/fmt"]
+	path = N64Recomp/lib/fmt
+	url = https://github.com/fmtlib/fmt
+[submodule "N64Recomp/lib/rabbitizer"]
+	path = N64Recomp/lib/rabbitizer
+	url = https://github.com/Decompollaborate/rabbitizer
+[submodule "N64Recomp/lib/sljit"]
+	path = N64Recomp/lib/sljit
+	url = https://github.com/zherczeg/sljit
+[submodule "N64Recomp/lib/tomlplusplus"]
+	path = N64Recomp/lib/tomlplusplus
+	url = https://github.com/marzer/tomlplusplus
