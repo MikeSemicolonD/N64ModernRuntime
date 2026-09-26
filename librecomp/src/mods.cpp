@@ -1057,10 +1057,9 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
 
     bool mods_loaded = active_game != (size_t)-1;
 
-    // Do nothing if mods have already been loaded and this mod isn't runtime toggleable.
-    if (!mod.is_runtime_toggleable() && mods_loaded) {
-        return;
-    }
+    // A mod that isn't runtime toggleable only records and saves the new state once mods are loaded; it applies on the next launch.
+    bool deferred = mods_loaded && !mod.is_runtime_toggleable();
+    bool run_callbacks = mods_loaded && !deferred;
 
     // Do nothing if mods have already been loaded and this mod isn't for the active game.
     if (mods_loaded && !mod.is_for_game(active_game)) {
@@ -1071,7 +1070,7 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
         bool was_enabled = enabled_mods.emplace(mod_id).second;
 
         // If mods have been loaded and a mod was successfully enabled by this call, call the on_enabled handlers for its content types.
-        if (was_enabled && mods_loaded) {
+        if (was_enabled && run_callbacks) {
             for (ModContentTypeId type_id : mod.content_types) {
                 content_enabled_callback* callback = content_types[type_id.value].on_enabled;
                 if (callback) {
@@ -1095,7 +1094,7 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
                             auto_enabled_mods.emplace(dependency.mod_id);
                             mod_stack.emplace_back(dependency.mod_id);
 
-                            if (mods_loaded) {
+                            if (run_callbacks) {
                                 for (ModContentTypeId type_id : mod_from_stack_handle.content_types) {
                                     content_enabled_callback* callback = content_types[type_id.value].on_enabled;
                                     if (callback) {
@@ -1113,7 +1112,7 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
         bool was_disabled = enabled_mods.erase(mod_id) != 0;
 
         // If mods have been loaded and a mod was successfully disabled by this call, call the on_disabled handlers for its content types.
-        if (was_disabled && mods_loaded) {
+        if (was_disabled && run_callbacks) {
             for (ModContentTypeId type_id : mod.content_types) {
                 content_disabled_callback* callback = content_types[type_id.value].on_disabled;
                 if (callback) {
@@ -1145,7 +1144,7 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
                 }
             }
 
-            if (mods_loaded) {
+            if (run_callbacks) {
                 // Before replacing the old set with the new one, whatever does not exist in the new set anymore should trigger it's on_disabled callback.
                 for (const std::string &enabled_mod_id : auto_enabled_mods) {
                     if (!new_auto_enabled_mods.contains(enabled_mod_id)) {
