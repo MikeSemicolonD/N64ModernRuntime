@@ -2,6 +2,9 @@
 #include <thread>
 #include <cassert>
 #include <string>
+#if defined(__GLIBC__)
+#include <cxxabi.h>
+#endif
 
 #include "ultramodern/ultra64.h"
 #include "ultramodern/ultramodern.hpp"
@@ -356,6 +359,11 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
             // Run the thread's function with the provided argument.
             run_thread_function(PASS_RDRAM entrypoint, self->sp, arg);
         } catch (ultramodern::thread_terminated& terminated) {
+#if defined(__GLIBC__)
+        } catch (abi::__forced_unwind&) {
+            // glibc's pthread_exit (end_deleted_thread) unwinds with this; swallowing it aborts the process.
+            throw;
+#endif
         } catch (const std::exception& e) {
             fprintf(stderr, "[Thread] EXCEPTION on thread id=%d entry=0x%08X: %s\n",
                 self->id, (uint32_t)entrypoint, e.what());

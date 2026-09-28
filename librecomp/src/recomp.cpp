@@ -23,6 +23,7 @@
 #include "ultramodern/error_handling.hpp"
 #include "librecomp/addresses.hpp"
 #include "librecomp/mods.hpp"
+#include "librecomp/fault_guard.hpp"
 #include "recompiler/live_recompiler.h"
 
 #ifdef _WIN32
@@ -533,7 +534,17 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
         fflush(stderr);
     }
 #else
-    invoke_recomp_func(func, rdram, &ctx);
+    // POSIX counterpart of the SEH wrapper above: a guest fault ends this thread instead of the process.
+    struct GuardedCall { recomp_func_t* func; uint8_t* rdram; recomp_context* ctx; } call{ func, rdram, &ctx };
+    recomp::fault_guard::Info fault{};
+    bool completed = recomp::fault_guard::run([](void* p) {
+        auto* c = static_cast<GuardedCall*>(p);
+        invoke_recomp_func(c->func, c->rdram, c->ctx);
+    }, &call, &fault);
+    if (!completed) {
+        fprintf(stderr, "[recomp] fault caught: thread_entry=0x%08X sig=%d addr=0x%p\n", (uint32_t)addr, fault.signo, (void*)fault.addr);
+        fflush(stderr);
+    }
 #endif
 }
 
