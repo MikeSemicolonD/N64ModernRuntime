@@ -21,6 +21,13 @@
 #include "ultramodern/rsp.hpp"
 #include "ultramodern/threads.hpp"
 
+// Runtime definitions a game may replace with its own. ld64 has no --allow-multiple-definition, so they are weak there.
+#if defined(__APPLE__)
+#define ULTRAMODERN_OVERRIDABLE __attribute__((weak))
+#else
+#define ULTRAMODERN_OVERRIDABLE
+#endif
+
 struct UltraThreadContext {
     // Magic sentinel at offset 0 to detect when an OSThread::context pointer
     // has been corrupted (recompiled game code writing into the surrounding

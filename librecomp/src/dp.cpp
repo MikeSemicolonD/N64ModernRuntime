@@ -1,3 +1,4 @@
+#include <ultramodern/ultramodern.hpp>
 #include "recomp.h"
 
 enum class RDPStatusBit {
@@ -43,7 +44,7 @@ extern "C" void osDpSetStatus_recomp(uint8_t* rdram, recomp_context* ctx) {
     update_bit(rdp_state, ctx->r4, RDPStatusBit::Flush);
 }
 
-extern "C" void osDpGetCounters_recomp(uint8_t* rdram, recomp_context* ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osDpGetCounters_recomp(uint8_t* rdram, recomp_context* ctx) {
     // Counter buffer pointer in r4 — write zeroes for all 8 counters.
     // buf_ptr must stay 64-bit so the sign-extended MIPS address (e.g. 0xFFFFFFFF80...)
     // survives the `- 0xFFFFFFFF80000000` subtraction inside MEM_W. Truncating to

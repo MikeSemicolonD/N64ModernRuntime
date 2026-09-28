@@ -399,7 +399,7 @@ recomp::RomValidationError recomp::select_rom(const std::filesystem::path& rom_p
     return recomp::RomValidationError::Good;
 }
 
-extern "C" void osGetMemSize_recomp(uint8_t * rdram, recomp_context * ctx) {
+extern "C" ULTRAMODERN_OVERRIDABLE void osGetMemSize_recomp(uint8_t * rdram, recomp_context * ctx) {
     ctx->r2 = 8 * 1024 * 1024;
 }
 

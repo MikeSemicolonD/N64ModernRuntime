@@ -936,7 +936,7 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     }
 }
 
-void ultramodern::submit_rdp_range(uint32_t lo_phys, uint32_t hi_phys) {
+ULTRAMODERN_OVERRIDABLE void ultramodern::submit_rdp_range(uint32_t lo_phys, uint32_t hi_phys) {
     if (hi_phys > lo_phys) {
         events_context.action_queue.enqueue(RdpRangeAction{ lo_phys, hi_phys });
     }
