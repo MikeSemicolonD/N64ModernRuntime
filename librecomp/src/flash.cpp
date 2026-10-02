@@ -10,10 +10,7 @@
 
 constexpr uint32_t flash_size = 1024 * 1024 / 8; // 1Mbit
 constexpr uint32_t page_size = 128;
-constexpr uint32_t pages_per_sector = 128;
 constexpr uint32_t page_count = flash_size / page_size;
-constexpr uint32_t sector_size = page_size * pages_per_sector;
-constexpr uint32_t sector_count = flash_size / sector_size;
 
 void save_write_ptr(const void* in, uint32_t offset, uint32_t count);
 void save_write(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t count);
@@ -143,8 +140,6 @@ extern "C" void osFlashWriteBuffer_recomp(uint8_t * rdram, recomp_context * ctx)
         ULTRAMODERN_QUICK_EXIT();
     }
 
-    OSIoMesg* mb = TO_PTR(OSIoMesg, ctx->r4);
-    int32_t pri = ctx->r5;
     PTR(void) dramAddr = ctx->r6;
     PTR(OSMesgQueue) mq = ctx->r7;
     
@@ -179,8 +174,6 @@ extern "C" void osFlashReadArray_recomp(uint8_t * rdram, recomp_context * ctx) {
         ULTRAMODERN_QUICK_EXIT();
     }
 
-    OSIoMesg* mb = TO_PTR(OSIoMesg, ctx->r4);
-    int32_t pri = ctx->r5;
     uint32_t page_num = ctx->r6;
     PTR(void) dramAddr = ctx->r7;
     uint32_t n_pages = MEM_W(0x10, ctx->r29);

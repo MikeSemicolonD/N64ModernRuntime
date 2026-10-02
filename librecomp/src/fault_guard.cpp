@@ -6,6 +6,11 @@
 #include <csignal>
 #include <mutex>
 #include <pthread.h>
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#else
+#include <ucontext.h>
+#endif
 
 // A host-side fault inside a guarded call skips destructors between the fault and run() (held locks stay held), as SEH does on Windows.
 namespace {
@@ -35,6 +40,22 @@ namespace {
         raise(sig);
     }
 
+    uintptr_t fault_pc(void* uc) {
+        const ucontext_t* u = static_cast<const ucontext_t*>(uc);
+#if defined(__APPLE__) && defined(__aarch64__)
+        return (uintptr_t)u->uc_mcontext->__ss.__pc;
+#elif defined(__APPLE__) && defined(__x86_64__)
+        return (uintptr_t)u->uc_mcontext->__ss.__rip;
+#elif defined(__aarch64__)
+        return (uintptr_t)u->uc_mcontext.pc;
+#elif defined(__x86_64__)
+        return (uintptr_t)u->uc_mcontext.gregs[REG_RIP];
+#else
+        (void)u;
+        return 0;
+#endif
+    }
+
     void handler(int sig, siginfo_t* si, void* uc) {
         Frame* frame = (g_active_guards.load(std::memory_order_relaxed) != 0) ? static_cast<Frame*>(pthread_getspecific(g_frame_key)) : nullptr;
         if (frame == nullptr) {
@@ -44,6 +65,7 @@ namespace {
         if (frame->info != nullptr) {
             frame->info->signo = sig;
             frame->info->addr = reinterpret_cast<uintptr_t>(si->si_addr);
+            frame->info->pc = fault_pc(uc);
         }
         siglongjmp(frame->jmp, 1);
     }

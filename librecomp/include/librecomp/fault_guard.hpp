@@ -8,6 +8,8 @@ namespace recomp::fault_guard {
     struct Info {
         int signo;
         uintptr_t addr;
+        // Host PC of the faulting instruction (0 where the platform is not handled).
+        uintptr_t pc;
     };
 
     // Runs fn(arg). Returns false if a SIGSEGV/SIGBUS was raised inside it (info filled), true otherwise.

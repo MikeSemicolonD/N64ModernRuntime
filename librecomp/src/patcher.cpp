@@ -41,10 +41,11 @@ bool read_u32(std::span<const uint8_t> patch_data, size_t& offset, uint32_t& num
     }
 
     number_out =
-        (uint32_t(patch_data[offset++]) <<  0) |
-        (uint32_t(patch_data[offset++]) <<  8) |
-        (uint32_t(patch_data[offset++]) << 16) |
-        (uint32_t(patch_data[offset++]) << 24);
+        (uint32_t(patch_data[offset + 0]) <<  0) |
+        (uint32_t(patch_data[offset + 1]) <<  8) |
+        (uint32_t(patch_data[offset + 2]) << 16) |
+        (uint32_t(patch_data[offset + 3]) << 24);
+    offset += 4;
     return true;
 }
 

@@ -32,7 +32,7 @@ extern "C" void isPrintfInit_recomp(uint8_t * rdram, recomp_context * ctx) {
 extern "C" void __osRdbSend_recomp(uint8_t * rdram, recomp_context * ctx) {
     gpr buf = ctx->r4;
     size_t size = ctx->r5;
-    u32 type = (u32)ctx->r6;
+    [[maybe_unused]] u32 type = (u32)ctx->r6;
     std::unique_ptr<char[]> to_print = std::make_unique<char[]>(size + 1);
 
     for (size_t i = 0; i < size; i++) {
@@ -49,8 +49,8 @@ extern "C" void is_proutSyncPrintf_recomp(uint8_t * rdram, recomp_context * ctx)
     // Buffering to speed up print performance
     static std::vector<char> print_buffer;
 
-    gpr buf = ctx->r5;
-    size_t size = ctx->r6;
+    [[maybe_unused]] gpr buf = ctx->r5;
+    [[maybe_unused]] size_t size = ctx->r6;
 
     //for (size_t i = 0; i < size; i++) {
     //    // Add the new character to the buffer

@@ -33,6 +33,7 @@ struct ModManifest {
     std::string minimum_recomp_version;
     std::unordered_map<std::string, std::vector<std::string>> native_libraries;
     bool custom_gamemode = false;
+    bool enabled_by_default = true;
     std::vector<toml::table> config_options;
     std::vector<std::string> dependencies;
     std::vector<std::string> full_dependency_strings;
@@ -371,6 +372,11 @@ ModManifest parse_mod_config_manifest(const std::filesystem::path& basedir, cons
     // Custom gamemode (optional)
     ret.custom_gamemode = read_toml_value<bool>(manifest_table, "custom_gamemode", false);
 
+    // Enabled by default (optional, true when absent)
+    if (manifest_table.contains("enabled_by_default")) {
+        ret.enabled_by_default = read_toml_value<bool>(manifest_table, "enabled_by_default", true);
+    }
+
     return ret;
 }
 
@@ -552,6 +558,10 @@ void write_manifest(const std::filesystem::path& path, const ModManifest& manife
 
     if (manifest.custom_gamemode) {
         output_data.emplace("custom_gamemode", manifest.custom_gamemode);
+    }
+
+    if (!manifest.enabled_by_default) {
+        output_data.emplace("enabled_by_default", manifest.enabled_by_default);
     }
 
     toml::json_formatter formatter{output_data, toml::format_flags::indentation | toml::format_flags::indentation};

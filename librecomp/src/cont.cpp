@@ -7,7 +7,6 @@
 
 static int g_cont_query_count = 0;
 static int g_cont_read_count = 0;
-static int g_motor_calls = 0;
 
 extern "C" void recomp_set_current_frame_poll_id(uint8_t* rdram, recomp_context* ctx) {
     // TODO reimplement the system for tagging polls with IDs to handle games with multithreaded input polling.

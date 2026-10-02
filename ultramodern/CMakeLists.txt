@@ -30,6 +30,8 @@ target_include_directories(ultramodern PUBLIC
     "${PROJECT_SOURCE_DIR}/../thirdparty/sse2neon"
 )
 
+target_compile_definitions(ultramodern PUBLIC SSE2NEON_SUPPRESS_WARNINGS)
+
 target_compile_options(ultramodern PRIVATE
 #    -Wall
 #    -Wextra
@@ -38,4 +40,5 @@ target_compile_options(ultramodern PRIVATE
 
 if (WIN32)
     add_compile_definitions(NOMINMAX)
+    target_compile_definitions(ultramodern PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()

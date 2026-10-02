@@ -72,6 +72,9 @@ namespace ultramodern {
             int rr_manual_value;
             int ds_option;
 
+            GraphicsConfig() = default;
+            GraphicsConfig(const GraphicsConfig&) = default;
+            GraphicsConfig& operator=(const GraphicsConfig&) = default;
             virtual ~GraphicsConfig() = default;
 
             auto operator<=>(const GraphicsConfig& rhs) const = default;

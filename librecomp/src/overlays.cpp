@@ -388,12 +388,8 @@ extern "C" recomp_func_t * get_function(int32_t addr) {
     if (func_find == func_map.end()) {
 #ifdef _MSC_VER
         void *ra = _ReturnAddress();
-        // The recomp doesn't update ctx->r31 at JAL sites, so functions that
-        // tail-return via `jr $t9` (where $t9 was set to $ra at entry) read
-        // stale $ra (often 0), emit LOOKUP_FUNC(0), and hit this stub. Those
-        // calls are benign — the host C return unwinds correctly. Log only
-        // the first occurrence per unique caller MIPS function so the log
-        // stays useful.
+        // JAL/JALR sites don't write ctx->r31 (only bgezal/bltzal-style links do, via emit_link_address), so a tail-return through a register copied from $ra can reach LOOKUP_FUNC(0).
+        // Those calls are benign since the host C return unwinds correctly; log once per caller MIPS function.
         static std::unordered_set<int32_t> seenCallerMips;
         uintptr_t raAddr = (uintptr_t)ra;
         int32_t bestMips = 0;

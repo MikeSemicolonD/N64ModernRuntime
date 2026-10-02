@@ -57,6 +57,7 @@ target_compile_options(librecomp PRIVATE
 
 if (WIN32)
     add_compile_definitions(NOMINMAX)
+    target_compile_definitions(librecomp PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 add_subdirectory(${PROJECT_SOURCE_DIR}/../thirdparty/miniz ${CMAKE_CURRENT_BINARY_DIR}/miniz)

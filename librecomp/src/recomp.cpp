@@ -31,6 +31,7 @@
 #    include <Windows.h>
 #else
 #    include <sys/mman.h>
+#    include <dlfcn.h>
 #endif
 
 #if defined(_WIN32)
@@ -542,7 +543,11 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
         invoke_recomp_func(c->func, c->rdram, c->ctx);
     }, &call, &fault);
     if (!completed) {
-        fprintf(stderr, "[recomp] fault caught: thread_entry=0x%08X sig=%d addr=0x%p\n", (uint32_t)addr, fault.signo, (void*)fault.addr);
+        // pc_off is the offset into the faulting library, for addr2line on its unstripped build.
+        Dl_info dl{};
+        const bool have_dl = fault.pc != 0 && dladdr((void*)fault.pc, &dl) != 0;
+        fprintf(stderr, "[recomp] fault caught: thread_entry=0x%08X sig=%d addr=0x%p pc=0x%p pc_off=0x%llX lib=%s sym=%s\n", (uint32_t)addr, fault.signo, (void*)fault.addr, (void*)fault.pc,
+                have_dl ? (unsigned long long)(fault.pc - (uintptr_t)dl.dli_fbase) : 0ull, (have_dl && dl.dli_fname) ? dl.dli_fname : "?", (have_dl && dl.dli_sname) ? dl.dli_sname : "?");
         fflush(stderr);
     }
 #endif
@@ -765,8 +770,6 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                 // the entrypoint runs (heap setup or saving init). One-shot
                 // at startup. ROGUESQ_LOG_INIT=1.
                 static const bool log_init = []{
-                    const char *a = std::getenv("ROGUESQ_LOG_ALL");
-                    if (a && *a && *a != '0') return true;
                     const char *e = std::getenv("ROGUESQ_LOG_INIT");
                     return e && *e && *e != '0';
                 }();
@@ -793,6 +796,7 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
         case GameStatus::None:
             return true;
     }
+    return true;
 }
 
 recomp::SaveType recomp::get_save_type() {

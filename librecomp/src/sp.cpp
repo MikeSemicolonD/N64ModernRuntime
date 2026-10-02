@@ -15,10 +15,8 @@ extern "C" ULTRAMODERN_OVERRIDABLE void osSpTaskStartGo_recomp(uint8_t* rdram, r
     {
         // SP task dispatch trace. Useful for tracking task scheduling
         // rate (cinematic ~30/s, normal play 1-2/frame). Default off.
-        // ROGUESQ_LOG_SP_TASKS=1 (or ROGUESQ_LOG_ALL=1).
+        // ROGUESQ_LOG_SP_TASKS=1.
         static const bool log_sp = []{
-            const char *a = std::getenv("ROGUESQ_LOG_ALL");
-            if (a && *a && *a != '0') return true;
             const char *e = std::getenv("ROGUESQ_LOG_SP_TASKS");
             return e && *e && *e != '0';
         }();

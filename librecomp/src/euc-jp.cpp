@@ -23,9 +23,6 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
-#include <locale>
-#include <codecvt>
 #include <string>
 #include <string_view>
 #include "euc-jp.hpp"
@@ -2579,8 +2576,26 @@ namespace Encoding {
         }
         utf32_str.resize(len);
 
-        std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> conv;
-        std::string utf8_str = conv.to_bytes(utf32_str);
+        std::string utf8_str;
+        utf8_str.reserve(utf32_str.size() * 3);
+        for (char32_t cp : utf32_str) {
+            if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+            if (cp < 0x80) {
+                utf8_str.push_back(char(cp));
+            } else if (cp < 0x800) {
+                utf8_str.push_back(char(0xC0 | (cp >> 6)));
+                utf8_str.push_back(char(0x80 | (cp & 0x3F)));
+            } else if (cp < 0x10000) {
+                utf8_str.push_back(char(0xE0 | (cp >> 12)));
+                utf8_str.push_back(char(0x80 | ((cp >> 6) & 0x3F)));
+                utf8_str.push_back(char(0x80 | (cp & 0x3F)));
+            } else {
+                utf8_str.push_back(char(0xF0 | (cp >> 18)));
+                utf8_str.push_back(char(0x80 | ((cp >> 12) & 0x3F)));
+                utf8_str.push_back(char(0x80 | ((cp >> 6) & 0x3F)));
+                utf8_str.push_back(char(0x80 | (cp & 0x3F)));
+            }
+        }
 
         return utf8_str;
     }

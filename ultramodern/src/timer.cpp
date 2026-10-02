@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <thread>
 #include <variant>
 #include <set>
@@ -15,10 +16,19 @@
 static std::chrono::high_resolution_clock::time_point start_time = std::chrono::high_resolution_clock::now();
 // Offset of the duration since program start used to calculate the value for osGetTime. 
 static int64_t ostime_offset = 0;
-// Game speed multiplier (1 means no speedup)
-constexpr uint32_t speed_multiplier = 1;
+// Game speed multiplier (1 means no speedup). ROGUESQ_SPEED=<1..16> runs the VI clock and CPU counter faster, for replays under a fixed timestep.
+static uint32_t speed_multiplier() {
+    static const uint32_t s = []() {
+        const char* e = std::getenv("ROGUESQ_SPEED");
+        const int v = (e && e[0]) ? std::atoi(e) : 1;
+        return (uint32_t)(v < 1 ? 1 : (v > 16 ? 16 : v));
+    }();
+    return s;
+}
 // N64 CPU counter ticks per millisecond
-constexpr uint32_t counter_per_ms = 46'875 * speed_multiplier;
+static uint32_t counter_per_ms() {
+    return 46'875 * speed_multiplier();
+}
 
 struct OSTimer {
     PTR(OSTimer) unused1;
@@ -48,14 +58,14 @@ uint64_t duration_to_ticks(std::chrono::high_resolution_clock::duration duration
     uint64_t delta_micros = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
     // More accurate than using a floating point timer, will only overflow after running for 12.47 years
     // Units: (micros * (counts/millis)) / (micros/millis) = counts
-    uint64_t total_count = (delta_micros * counter_per_ms) / 1000;
+    uint64_t total_count = (delta_micros * counter_per_ms()) / 1000;
 
     return total_count;
 }
 
 std::chrono::microseconds ticks_to_duration(uint64_t ticks) {
     using namespace std::chrono_literals;
-    return ticks * 1000us / counter_per_ms;
+    return ticks * 1000us / counter_per_ms();
 }
 
 std::chrono::high_resolution_clock::time_point ticks_to_timepoint(uint64_t ticks) {
@@ -146,7 +156,7 @@ void ultramodern::init_timers(RDRAM_ARG1) {
 }
 
 uint32_t ultramodern::get_speed_multiplier() {
-    return speed_multiplier;
+    return speed_multiplier();
 }
 
 std::chrono::high_resolution_clock::time_point ultramodern::get_start() {

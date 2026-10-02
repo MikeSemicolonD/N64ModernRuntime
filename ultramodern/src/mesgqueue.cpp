@@ -13,7 +13,6 @@
 namespace mqdiag {
     // Per-source indices: 0=Timer,1=Sp,2=Si,3=Ai,4=Vi,5=Pi,6=Dp,7=Untagged
     static constexpr int kNumSrc = 8;
-    static const char *kSrcName[kNumSrc] = { "Tmr", "Sp", "Si", "Ai", "Vi", "Pi", "Dp", "Unt" };
     struct Counts {
         std::atomic<uint64_t> sends{0}, recvs{0}, external{0}, delivered{0}, drop_blocked{0};
         std::atomic<uint64_t> blocked_lost{0}, blocked_requeued{0};
@@ -277,7 +276,7 @@ bool do_recv(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, bool block) {
 
 extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
     mqdiag::bump_send(static_cast<uint32_t>(mq_));
-    OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
+    [[maybe_unused]] OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
     bool jam = false;
     
     // Don't directly send to the message queue if this isn't a game thread to avoid contention.
@@ -299,7 +298,7 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
 }
 
 extern "C" s32 osJamMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) {
-    OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
+    [[maybe_unused]] OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
     bool jam = true;
     
     // Don't directly send to the message queue if this isn't a game thread to avoid contention.
@@ -322,7 +321,7 @@ extern "C" s32 osJamMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) 
 
 extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32 flags) {
     mqdiag::bump_recv(static_cast<uint32_t>(mq_));
-    OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
+    [[maybe_unused]] OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
 
     assert(ultramodern::is_game_thread() && "RecvMesg not allowed outside of game threads.");
     

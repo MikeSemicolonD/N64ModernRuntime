@@ -464,6 +464,24 @@ N64Recomp::Config::Config(const char* path) {
             function_hooks = get_function_hooks(table);
         }
 
+        // Extra patch files (optional): their instruction patches and hooks are appended to the main config's.
+        toml::node_view patch_files_data = input_data["patch_files"];
+        if (patch_files_data.is_array()) {
+            for (const toml::node& el : *patch_files_data.as_array()) {
+                std::optional<std::string> file = el.value<std::string>();
+                if (!file.has_value()) {
+                    throw toml::parse_error("Invalid patch_files entry", el.source());
+                }
+                const toml::table file_data = toml::parse_file(concat_if_not_empty(basedir, file.value()).u8string());
+                if (const toml::table* file_patches = file_data["patches"].as_table()) {
+                    std::vector<N64Recomp::InstructionPatch> extra_insns = get_instruction_patches(file_patches);
+                    instruction_patches.insert(instruction_patches.end(), extra_insns.begin(), extra_insns.end());
+                    std::vector<N64Recomp::FunctionTextHook> extra_hooks = get_function_hooks(file_patches);
+                    function_hooks.insert(function_hooks.end(), extra_hooks.begin(), extra_hooks.end());
+                }
+            }
+        }
+
         // Use trace mode if enabled (optional)
         std::optional<bool> trace_mode_opt = input_data["trace_mode"].value<bool>();
         if (trace_mode_opt.has_value()) {

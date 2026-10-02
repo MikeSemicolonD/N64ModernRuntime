@@ -68,11 +68,9 @@ namespace {
     // (wstring construction failing, SetThreadDescription COM init issues)
     // and stay around for future debugging. Default off — they emit ~3
     // lines per thread × ~20 threads at startup. ROGUESQ_LOG_THREADS=1
-    // (or ROGUESQ_LOG_ALL=1) to enable.
+    // to enable.
     bool log_threads_native() {
         static const bool v = []{
-            const char *a = std::getenv("ROGUESQ_LOG_ALL");
-            if (a && *a && *a != '0') return true;
             const char *e = std::getenv("ROGUESQ_LOG_THREADS");
             return e && *e && *e != '0';
         }();
@@ -100,7 +98,7 @@ void ultramodern::set_native_thread_name(const std::string& name) {
 }
 
 void ultramodern::set_native_thread_priority(ThreadPriority pri) {
-    int nPriority = THREAD_PRIORITY_NORMAL;
+    [[maybe_unused]] int nPriority = THREAD_PRIORITY_NORMAL;
 
     // Convert ThreadPriority to Win32 priority
     switch (pri) {
@@ -318,10 +316,8 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
     OSThread *self = TO_PTR(OSThread, self_);
     // [Thread] entry/name lines emit twice per thread × ~15 threads at
     // startup. Useful for thread-system crash investigation; default off.
-    // Honors ROGUESQ_LOG_THREAD_LIFECYCLE / ROGUESQ_LOG_ALL.
+    // Honors ROGUESQ_LOG_THREAD_LIFECYCLE.
     static const bool log_t = []{
-        const char *a = std::getenv("ROGUESQ_LOG_ALL");
-        if (a && *a && *a != '0') return true;
         const char *e = std::getenv("ROGUESQ_LOG_THREAD_LIFECYCLE");
         return e && *e && *e != '0';
     }();

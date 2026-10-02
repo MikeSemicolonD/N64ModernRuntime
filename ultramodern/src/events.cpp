@@ -34,9 +34,9 @@ extern moodycamel::LightweightSemaphore g_gfx_task_parsed;
 // a few ms); wait for the in-flight parse instead. Bounded. ROGUESQ_VI_WAIT_PARSE=0 disables.
 // Count a graphics task as in flight from the moment the game submits it (osSpTaskStartGo), not from
 // when the gfx thread dequeues it: the game keeps running on its own host thread in between.
-extern "C" volatile unsigned g_rs64_gfx_requests = 0;
+extern "C" { volatile unsigned g_rs64_gfx_requests = 0; }
 extern "C" void rs64_gfx_task_submitted(void) {
-    ++g_rs64_gfx_requests;
+    g_rs64_gfx_requests = g_rs64_gfx_requests + 1;
     g_gfx_parse_inflight.fetch_add(1, std::memory_order_acq_rel);
 }
 extern "C" void rs64_wait_gfx_parse(void) {
@@ -98,7 +98,8 @@ static uint8_t* take_rdram_snapshot(const uint8_t* rdram) {
         std::chrono::high_resolution_clock::now() - snap0).count();
     return b;
 }
-extern "C" uint8_t* g_rs64_parse_rdram = nullptr;   // read by send_dl: parse input when non-null
+// Read by send_dl: parse input when non-null.
+extern "C" { uint8_t* g_rs64_parse_rdram = nullptr; }
 extern "C" unsigned long long rs64_cine_iter_get(void);   // host cinematic-loop iteration (matches ROGUESQ_DUMP_RDRAM_ON_CINE_ITER / PJ64 cine_frame<n> goldens)
 extern "C" volatile int g_active_overlay;                 // 0=mission/gameplay, 1=menu, 2=cinematic, -1=none (rs64_load_overlay)
 
@@ -395,15 +396,6 @@ void vi_thread_func() {
         // If the game has started, handle sending VI and AI events.
         if (ultramodern::is_game_started()) {
             remaining_retraces--;
-            // Hold this retrace while a graphics parse is in flight (before taking message_mutex: the
-            // completion path needs it). Bounded so a runaway parse cannot stop the VI clock.
-            // Off by default (2026-09-08): the game thread already waits at frame start, and holding the
-            // retrace starves the synth tick (audio dropouts). ROGUESQ_VI_HOLD_PARSE=1 re-enables.
-            static const bool s_vi_hold = [](){ const char* e = std::getenv("ROGUESQ_VI_HOLD_PARSE"); return e && e[0] && e[0] != '0'; }();
-            if (s_vi_hold && remaining_retraces == 0 && vi_wait_parse_enabled() && g_gfx_parse_inflight.load(std::memory_order_acquire)) {
-                std::unique_lock<std::mutex> plock{ g_gfx_parse_mutex };
-                g_gfx_parse_cv.wait_for(plock, std::chrono::milliseconds(50), []{ return g_gfx_parse_inflight.load(std::memory_order_acquire) == 0; });
-            }
 
             std::lock_guard lock{ events_context.message_mutex };
             ViState* cur_state = events_context.vi.get_cur_state();
@@ -427,22 +419,8 @@ void vi_thread_func() {
                 remaining_retraces = cur_state->retrace_count;
             }
             if (!ai_consumption_paced() && events_context.ai.mq != NULLPTR) {
-                // The AI event wakes the game's audio thread to synth + submit one
-                // ~768-byte buffer. Firing it once per VI (60/s) only sustains ~half of
-                // 22050Hz (the audio underproduces -> crackle/cut). On hardware the AI
-                // interrupt fires per buffer CONSUMED (~120/s here). Fire N per retrace
-                // (default 2 ~= 120/s for 192-frame buffers @22050). ROGUESQ_AI_PER_VI
-                // overrides (1 = old behavior). Extra messages past what the audio thread
-                // can dequeue are simply dropped (requeue=false), so this self-limits.
-                // Default 1 (one per VI): firing more (=2) DID reach ~realtime production
-                // but the game then submits buffers the synth hasn't filled yet -> garbled
-                // / screechy. So AI-rate forcing is the wrong lever here; left as an opt-in
-                // knob for experiments. Real fix = let the synth fill before submit (async).
-                static int n_ai = -1;
-                if (n_ai < 0) { const char* e = std::getenv("ROGUESQ_AI_PER_VI"); n_ai = (e && e[0]) ? atoi(e) : 1; if (n_ai < 1) n_ai = 1; if (n_ai > 8) n_ai = 8; }
-                for (int i = 0; i < n_ai; ++i) {
-                    ultramodern::enqueue_external_message_src(events_context.ai.mq, events_context.ai.msg, false, ultramodern::EventMessageSource::Ai);
-                }
+                // One AI event per VI; firing more makes the game submit buffers the synth has not filled yet (garbled audio).
+                ultramodern::enqueue_external_message_src(events_context.ai.mq, events_context.ai.msg, false, ultramodern::EventMessageSource::Ai);
             }
         }
 
@@ -453,13 +431,13 @@ void vi_thread_func() {
 }
 
 void sp_complete() {
-    uint8_t* rdram = events_context.rdram;
+    [[maybe_unused]] uint8_t* rdram = events_context.rdram;
     std::lock_guard lock{ events_context.message_mutex };
     ultramodern::enqueue_external_message_src(events_context.sp.mq, events_context.sp.msg, false, ultramodern::EventMessageSource::Sp);
 }
 
 void dp_complete() {
-    uint8_t* rdram = events_context.rdram;
+    [[maybe_unused]] uint8_t* rdram = events_context.rdram;
     std::lock_guard lock{ events_context.message_mutex };
     static const bool s_lfq = [](){ const char* e = std::getenv("ROGUESQ_LOG_FRAMEQ"); return e && *e && *e != '0'; }();
     if (s_lfq) { static unsigned n = 0; fprintf(stderr, "[frameq] dp_complete #%u -> mq=0x%06X\n", ++n, (uint32_t)events_context.dp.mq & 0xFFFFFFu); fflush(stderr); }
@@ -629,21 +607,8 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 PTR(u64) displaylist = task_action->task.t.data_ptr;
                 ultramodern::extensions::on_displaylist_submitted(displaylist);
 
-                // HLE rendering (send_dl) is suppressed for Rogue Squadron — the game
-                // uses Factor5 ucode, which we drive via the LLE recompile + dpc_bridge.
-                // Running HLE in parallel races with LLE (flicker) and floods the
-                // gfx_thread, starving the Win32 message pump (Not Responding).
-                // We keep sp_complete/dp_complete so the game's frame state machine
-                // still advances on the expected schedule.
                 [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
-                // RogueSquadron64Recomp: send_dl RE-ENABLED. RT64 has a
-                // GBI_F3DFACTOR5 implementation (rt64_gbi_f3dfactor5.cpp)
-                // and the Factor 5 ucode hash IS in RT64's database
-                // (rt64_gbi.cpp lines 166, 264). HLE GBI handles Factor 5
-                // commands properly. The previous LLE-only approach
-                // bypasses the registered GBI and submits raw RDP that
-                // confuses RT64 state. See project_factor5_lle_breakthrough.md
-                // for context but supersede with HLE path.
+                // RogueSquadron64Recomp renders the Factor 5 ucode through RT64's HLE GBI_F3DFACTOR5 profile via send_dl.
                 // ROGUESQ_LOG_GFX_TASK=1: one line per gfx task around the parse (stall diagnosis).
                 static const bool s_log_task = [](){ const char* e = std::getenv("ROGUESQ_LOG_GFX_TASK"); return e && *e && *e != '0'; }();
                 static unsigned s_task_n = 0; ++s_task_n;

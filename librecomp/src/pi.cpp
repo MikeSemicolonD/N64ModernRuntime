@@ -327,8 +327,8 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
 }
 
 extern "C" void osPiStartDma_recomp(RDRAM_ARG recomp_context* ctx) {
-    uint32_t mb = ctx->r4;
-    uint32_t pri = ctx->r5;
+    [[maybe_unused]] uint32_t mb = ctx->r4;
+    [[maybe_unused]] uint32_t pri = ctx->r5;
     uint32_t direction = ctx->r6;
     uint32_t devAddr = ctx->r7 | recomp::rom_base;
     gpr dramAddr = MEM_W(0x10, ctx->r29);
