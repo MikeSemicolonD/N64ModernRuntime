@@ -1948,6 +1948,21 @@ void N64Recomp::LiveGenerator::emit_comment(const std::string& comment) const {
     // Nothing to do here.
 }
 
+void N64Recomp::LiveGenerator::emit_native_hook(const NativeHook& hook) const {
+    // Load rdram and ctx into R0 and R1, as the entry hook call does.
+    sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
+    if (!hook.can_return) {
+        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_IMM, sljit_sw(hook.func));
+        return;
+    }
+    // A nonzero result returns from the function at once, like the text hook's `return;`.
+    sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2(32, P, P), SLJIT_IMM, sljit_sw(hook.func));
+    sljit_jump* keep_going = sljit_emit_cmp(compiler, SLJIT_EQUAL | SLJIT_32, SLJIT_RETURN_REG, 0, SLJIT_IMM, 0);
+    sljit_emit_return_void(compiler);
+    sljit_set_label(keep_going, sljit_emit_label(compiler));
+}
+
 bool N64Recomp::recompile_function_live(LiveGenerator& generator, const Context& context, size_t function_index, std::ostream& output_file, std::span<std::vector<uint32_t>> static_funcs_out, bool tag_reference_relocs) {
     return recompile_function_custom(generator, context, function_index, output_file, static_funcs_out, tag_reference_relocs);
 }

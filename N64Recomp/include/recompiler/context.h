@@ -22,6 +22,13 @@ constexpr uint32_t byteswap(uint32_t val) {
 #endif
 
 namespace N64Recomp {
+    // A host function called as void(uint8_t* rdram, recomp_context* ctx), or int(...) when can_return, where a nonzero result returns from the recompiled function.
+    // The live recompiler uses these to replay hooks that a static recompile applied as text.
+    struct NativeHook {
+        void* func;
+        bool can_return;
+    };
+
     struct Function {
         uint32_t vram;
         uint32_t rom;
@@ -32,6 +39,8 @@ namespace N64Recomp {
         bool reimplemented;
         bool stubbed;
         std::unordered_map<int32_t, std::string> function_hooks;
+        // Keyed like function_hooks: instruction index, or -1 for the function's entry.
+        std::unordered_map<int32_t, NativeHook> native_hooks;
 
         Function(uint32_t vram, uint32_t rom, std::vector<uint32_t> words, std::string name, uint16_t section_index, bool ignored = false, bool reimplemented = false, bool stubbed = false)
                 : vram(vram), rom(rom), words(std::move(words)), name(std::move(name)), section_index(section_index), ignored(ignored), reimplemented(reimplemented), stubbed(stubbed) {}

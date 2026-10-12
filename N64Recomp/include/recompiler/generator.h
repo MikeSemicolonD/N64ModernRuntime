@@ -66,6 +66,7 @@ namespace N64Recomp {
         virtual void emit_pause_self() const = 0;
         virtual void emit_trigger_event(uint32_t event_index) const = 0;
         virtual void emit_comment(const std::string& comment) const = 0;
+        virtual void emit_native_hook(const NativeHook& hook) const = 0;
     };
 
     class CGenerator final : Generator {
@@ -104,6 +105,7 @@ namespace N64Recomp {
         void emit_pause_self() const final;
         void emit_trigger_event(uint32_t event_index) const final;
         void emit_comment(const std::string& comment) const final;
+        void emit_native_hook(const NativeHook& hook) const final;
     private:
         void get_operand_string(Operand operand, UnaryOpType operation, const InstructionContext& context, std::string& operand_string) const;
         void get_binary_expr_string(BinaryOpType type, const BinaryOperands& operands, const InstructionContext& ctx, const std::string& output, std::string& expr_string) const;

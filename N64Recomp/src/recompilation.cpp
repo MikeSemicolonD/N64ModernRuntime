@@ -133,6 +133,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             print_indent();
         }
     }
+    auto native_hook_find = func.native_hooks.find(static_cast<int32_t>(instr_index));
+    if (native_hook_find != func.native_hooks.end()) {
+        generator.emit_native_hook(native_hook_find->second);
+    }
 
     // Output a comment with the original instruction
     print_indent();
@@ -796,6 +800,10 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
         auto hook_find = func.function_hooks.find(-1);
         if (hook_find != func.function_hooks.end()) {
             fmt::print(output_file, "    {}\n", hook_find->second);
+        }
+        auto native_hook_find = func.native_hooks.find(-1);
+        if (native_hook_find != func.native_hooks.end()) {
+            generator.emit_native_hook(native_hook_find->second);
         }
 
         // First pass, disassemble each instruction and collect branch labels

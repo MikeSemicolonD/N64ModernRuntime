@@ -125,6 +125,7 @@ namespace recomp {
             OfflineModHooked,
             NoSpecifiedApiVersion,
             UnsupportedApiVersion,
+            HookedStaticallyPatchedFunc,
         };
 
         std::string error_to_string(CodeModLoadError);

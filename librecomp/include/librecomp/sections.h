@@ -55,4 +55,22 @@ typedef struct {
     recomp_func_t* func;
 } ManualPatchSymbol;
 
+// A recompiler-config hook the live recompiler can replay when a mod hook regenerates the function: func(rdram, ctx) runs before
+// the instruction at insn_vram (0 = the function's entry); when can_return, func returns int and a nonzero result returns from the function.
+typedef struct {
+    uint32_t section_rom;
+    uint32_t func_vram;
+    uint32_t insn_vram;
+    void* func;
+    int can_return;
+} StaticPatchHook;
+
+// A recompiler-config instruction patch, re-applied when a mod hook regenerates the function from the ROM.
+typedef struct {
+    uint32_t section_rom;
+    uint32_t func_vram;
+    uint32_t vram;
+    uint32_t value;
+} StaticPatchInstruction;
+
 #endif

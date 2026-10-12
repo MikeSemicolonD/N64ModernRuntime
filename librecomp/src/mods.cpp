@@ -323,6 +323,13 @@ recomp::mods::CodeModLoadError recomp::mods::ModHandle::load_native_library(cons
 
     std::unique_ptr<DynamicLibrary>& lib = native_libraries.emplace_back(std::make_unique<DynamicLibrary>(lib_path));
 
+#if defined(__ANDROID__)
+    // An app can't load libraries from its data folder reliably, so an Android build packs a mod's library into the APK as lib<name>.so; the linker finds that by bare name.
+    if (!lib->good()) {
+        lib = std::make_unique<DynamicLibrary>(std::filesystem::path{"lib" + lib_filename});
+    }
+#endif
+
     if (!lib->good()) {
         error_param = lib_filename;
         return CodeModLoadError::FailedToLoadNativeLibrary;
@@ -1374,7 +1381,19 @@ N64Recomp::Context context_from_regenerated_list(const RegeneratedList& regenlis
             // Copy the function's words.
             const uint32_t* func_words = reinterpret_cast<const uint32_t*>(rom.data() + function_out.rom);
             function_out.words.assign(func_words, func_words + function_in.size / sizeof(uint32_t));
-            
+
+            // Re-apply the base recomp's config patches, which the ROM words don't carry.
+            std::vector<const StaticPatchHook*> replay_hooks;
+            std::vector<const StaticPatchInstruction*> replay_instructions;
+            recomp::overlays::get_static_patch_replays(section_out.rom_addr, function_out.vram, replay_hooks, replay_instructions);
+            for (const StaticPatchInstruction* insn : replay_instructions) {
+                function_out.words[(insn->vram - function_out.vram) / sizeof(uint32_t)] = byteswap(insn->value);
+            }
+            for (const StaticPatchHook* hook : replay_hooks) {
+                int32_t index = hook->insn_vram == 0 ? -1 : static_cast<int32_t>((hook->insn_vram - function_out.vram) / sizeof(uint32_t));
+                function_out.native_hooks[index] = N64Recomp::NativeHook{ hook->func, hook->can_return != 0 };
+            }
+
             // Add the function to the lookup table.
             ret.functions_by_vram[function_out.vram].push_back(function_index);
         }
@@ -1971,7 +1990,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
                 });
                 return ret;
             }
-            
+
             // Check if this function has been patched by the base recomp.
             if constexpr (!patched_regenlist) {
                 auto find_patched_it = base_patched_funcs.find(func_entry.func);
@@ -2337,6 +2356,15 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::init_mod_code(uint8_t* 
             .function_vram = hook.original_vram,
             .at_return = (hook.flags & N64Recomp::HookFlags::AtReturn) == N64Recomp::HookFlags::AtReturn
         };
+        // Regenerating a hooked function from the ROM re-applies its recompiler-config patches, unless one of them can't be replayed.
+        if (!recomp::overlays::can_replay_static_patches(recomp::overlays::get_func_by_section_rom_function_vram(def.section_rom, def.function_vram))) {
+            std::stringstream error_param_stream{};
+            error_param_stream << std::hex <<
+                "section: 0x" << def.section_rom <<
+                " func: 0x" << std::setfill('0') << std::setw(8) << def.function_vram;
+            error_param = error_param_stream.str();
+            return CodeModLoadError::HookedStaticallyPatchedFunc;
+        }
         // Check if the hook definition already exists in the hook slots.
         auto find_it = hook_slots.find(def);
         if (find_it == hook_slots.end()) {
@@ -2642,7 +2670,7 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
         // Check if this function has already been patched by the base recomp, but allow it if this is a force patch.
         if ((replacement.flags & N64Recomp::ReplacementFlags::Force) == N64Recomp::ReplacementFlags(0)) {
             auto find_it = base_patched_funcs.find(to_replace);
-            if (find_it != base_patched_funcs.end()) {
+            if (find_it != base_patched_funcs.end() || recomp::overlays::is_statically_patched(to_replace)) {
                 std::stringstream error_param_stream{};
                 error_param_stream << std::hex <<
                     "section: 0x" << replacement.original_section_vrom <<
@@ -2650,6 +2678,10 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
                 error_param = error_param_stream.str();
                 return CodeModLoadError::BaseRecompConflict;
             }
+        }
+        else if (recomp::overlays::is_statically_patched(to_replace)) {
+            fprintf(stderr, "Mod %s force-replaces 0x%08X, which the base game patches; only patches the mod's copy carries remain.\n",
+                mod.manifest.mod_id.c_str(), replacement.original_vram);
         }
 
         // Check if this function has already been replaced.

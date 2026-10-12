@@ -417,7 +417,9 @@ void N64Recomp::CGenerator::emit_function_call_by_register(int reg) const {
 void N64Recomp::CGenerator::emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset) const {
     (void)target_section_offset;
     const N64Recomp::ReferenceSymbol& sym = context.get_reference_symbol(section_index, symbol_index);
-    fmt::print(output_file, "{}(rdram, ctx);\n", sym.name);
+    // Reference symbols keep the dumped names, so apply the same _recomp rename the base recompile gives reimplemented and ignored functions.
+    const bool renamed = N64Recomp::reimplemented_funcs.contains(sym.name) || N64Recomp::ignored_funcs.contains(sym.name) || N64Recomp::renamed_funcs.contains(sym.name);
+    fmt::print(output_file, "{}{}(rdram, ctx);\n", sym.name, renamed ? "_recomp" : "");
 }
 
 void N64Recomp::CGenerator::emit_function_call(const Context& context, size_t function_index) const {
@@ -565,6 +567,12 @@ void N64Recomp::CGenerator::emit_trigger_event(uint32_t event_index) const {
 
 void N64Recomp::CGenerator::emit_comment(const std::string& comment) const {
     fmt::print(output_file, "// {}\n", comment);
+}
+
+void N64Recomp::CGenerator::emit_native_hook(const NativeHook& hook) const {
+    // Static output carries hooks as text (function_hooks); a native hook only has a host address, which C output can't name.
+    (void)hook;
+    fmt::print(output_file, "#error native hooks are only supported by the live recompiler\n");
 }
 
 void N64Recomp::CGenerator::process_binary_op(const BinaryOp& op, const InstructionContext& ctx) const {

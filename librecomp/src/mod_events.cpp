@@ -30,11 +30,14 @@ extern "C" void recomp_trigger_event(uint8_t* rdram, recomp_context* ctx, uint32
         ULTRAMODERN_QUICK_EXIT();
     }
 
-    // Copy the initial context state to restore it after running each callback.
-    recomp_context initial_context = *ctx;
-
     // Call every callback attached to the event.
     const std::vector<EventCallback>& callbacks = event_callbacks[event_index];
+    if (callbacks.empty()) {
+        return;
+    }
+
+    // Copy the initial context state to restore it after running each callback.
+    recomp_context initial_context = *ctx;
     for (const EventCallback& callback : callbacks) {
         // Run the callback.
         std::visit(overloaded {

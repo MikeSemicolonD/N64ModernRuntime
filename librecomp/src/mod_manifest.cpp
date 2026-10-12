@@ -1033,6 +1033,8 @@ std::string recomp::mods::error_to_string(CodeModLoadError error) {
             return "Mod DLL does not specify an API version";
         case CodeModLoadError::UnsupportedApiVersion:
             return "Mod DLL has an unsupported API version";
+        case CodeModLoadError::HookedStaticallyPatchedFunc:
+            return "Hooks a function the base game patches in its recompiler config; the hook would discard that patch";
     }
     return "Unknown code mod load error";
 }

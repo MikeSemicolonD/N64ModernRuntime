@@ -70,6 +70,47 @@ void recomp::overlays::register_patches(const char* patch, std::size_t size, Sec
     }
 }
 
+static std::unordered_map<recomp_func_t*, int> statically_patched_funcs;
+
+void recomp::overlays::register_statically_patched_funcs(recomp_func_t* const* funcs, const int* kinds, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        statically_patched_funcs[funcs[i]] |= kinds[i];
+    }
+}
+
+bool recomp::overlays::is_statically_patched(recomp_func_t* func) {
+    return statically_patched_funcs.count(func) != 0;
+}
+
+bool recomp::overlays::can_replay_static_patches(recomp_func_t* func) {
+    auto it = statically_patched_funcs.find(func);
+    return it == statically_patched_funcs.end() || (it->second & 4) == 0;
+}
+
+static uint64_t static_patch_key(uint32_t section_rom, uint32_t func_vram) {
+    return (uint64_t(section_rom) << 32) | func_vram;
+}
+
+static std::unordered_map<uint64_t, std::vector<const StaticPatchHook*>> static_patch_hooks_by_func;
+static std::unordered_map<uint64_t, std::vector<const StaticPatchInstruction*>> static_patch_instructions_by_func;
+
+void recomp::overlays::register_static_patch_replays(const StaticPatchHook* hooks, const StaticPatchInstruction* instructions) {
+    for (size_t i = 0; hooks[i].func != nullptr; i++) {
+        static_patch_hooks_by_func[static_patch_key(hooks[i].section_rom, hooks[i].func_vram)].push_back(&hooks[i]);
+    }
+    for (size_t i = 0; instructions[i].vram != 0; i++) {
+        static_patch_instructions_by_func[static_patch_key(instructions[i].section_rom, instructions[i].func_vram)].push_back(&instructions[i]);
+    }
+}
+
+void recomp::overlays::get_static_patch_replays(uint32_t section_rom, uint32_t func_vram, std::vector<const StaticPatchHook*>& hooks, std::vector<const StaticPatchInstruction*>& instructions) {
+    uint64_t key = static_patch_key(section_rom, func_vram);
+    auto hook_it = static_patch_hooks_by_func.find(key);
+    hooks = hook_it == static_patch_hooks_by_func.end() ? std::vector<const StaticPatchHook*>{} : hook_it->second;
+    auto insn_it = static_patch_instructions_by_func.find(key);
+    instructions = insn_it == static_patch_instructions_by_func.end() ? std::vector<const StaticPatchInstruction*>{} : insn_it->second;
+}
+
 void recomp::overlays::register_base_export(const std::string& name, recomp_func_t* func) {
     base_exports.emplace(name, func);
 }

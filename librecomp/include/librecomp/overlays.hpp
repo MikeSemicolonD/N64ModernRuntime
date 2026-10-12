@@ -29,6 +29,15 @@ namespace recomp {
         void register_base_exports(const FunctionExport* exports);
         void register_base_events(char const* const* event_names);
         void register_manual_patch_symbols(const ManualPatchSymbol* manual_patch_symbols);
+        // Functions the base recomp changed in its recompiler config (hooks, instruction patches) rather than in a patches ELF, with N64Recomp's
+        // kinds bitmask (patched_funcs.inl: 1 hook, 2 instruction patch, 4 a hook that can't be replayed).
+        void register_statically_patched_funcs(recomp_func_t* const* funcs, const int* kinds, size_t count);
+        bool is_statically_patched(recomp_func_t* func);
+        // False when regenerating the function for a mod hook would lose one of its config patches.
+        bool can_replay_static_patches(recomp_func_t* func);
+        // The config patches N64Recomp emits in recomp_overlays.inl; both lists end with a zero entry. Re-applied to functions regenerated for mod hooks.
+        void register_static_patch_replays(const StaticPatchHook* hooks, const StaticPatchInstruction* instructions);
+        void get_static_patch_replays(uint32_t section_rom, uint32_t func_vram, std::vector<const StaticPatchHook*>& hooks, std::vector<const StaticPatchInstruction*>& instructions);
         void read_patch_data(uint8_t* rdram, gpr patch_data_address);
 
         void init_overlays();
