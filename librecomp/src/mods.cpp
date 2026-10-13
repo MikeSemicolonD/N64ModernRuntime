@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <span>
 #include <fstream>
 #include <sstream>
@@ -1723,13 +1724,29 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
                 fail("not an object with an instruction_patches array");
                 continue;
             }
+            // A field is a number or a hex string ("0x800AE13C"); other fields (func, asm, note) are for readers.
+            auto word = [](const nlohmann::json& e, const char* key, uint32_t& out) {
+                auto it = e.find(key);
+                if (it == e.end()) return false;
+                if (it->is_number_unsigned()) {
+                    out = it->get<uint32_t>();
+                    return true;
+                }
+                if (!it->is_string()) return false;
+                const std::string s = it->get<std::string>();
+                char* end = nullptr;
+                const unsigned long long v = std::strtoull(s.c_str(), &end, 0);
+                if (s.empty() || *end != '\0' || v > 0xFFFFFFFFull) return false;
+                out = static_cast<uint32_t>(v);
+                return true;
+            };
             for (const auto& e : j["instruction_patches"]) {
-                if (!e.is_object() || !e.contains("section_rom") || !e.contains("func_vram") || !e.contains("vram") || !e.contains("value") || !e.contains("expect")) {
-                    fail("an entry needs section_rom, func_vram, vram, value and expect");
+                StaticPatchInstruction patch{};
+                uint32_t expect = 0;
+                if (!e.is_object() || !word(e, "section_rom", patch.section_rom) || !word(e, "func_vram", patch.func_vram) || !word(e, "vram", patch.vram) || !word(e, "value", patch.value) || !word(e, "expect", expect)) {
+                    fail("an entry needs section_rom, func_vram, vram, value and expect (numbers or \"0x...\" strings)");
                     break;
                 }
-                const StaticPatchInstruction patch{ e["section_rom"].get<uint32_t>(), e["func_vram"].get<uint32_t>(), e["vram"].get<uint32_t>(), e["value"].get<uint32_t>() };
-                const uint32_t expect = e["expect"].get<uint32_t>();
                 std::stringstream where{};
                 where << std::hex << "0x" << patch.vram << " in function 0x" << patch.func_vram << " (" << e.value("func", std::string{}) << ")";
                 auto section_it = section_vrom_map.find(patch.section_rom);

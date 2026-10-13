@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_map>
 #include <span>
+#include <vector>
 #include "sections.h"
 
 namespace recomp {

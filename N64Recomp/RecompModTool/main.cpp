@@ -5,10 +5,12 @@
 #include <numeric>
 #include <cctype>
 #include <cstdlib>
+#include <optional>
 #include "fmt/format.h"
 #include "fmt/ostream.h"
 #include "recompiler/context.h"
 #include <toml++/toml.hpp>
+#include "elfio/elfio.hpp"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -49,10 +51,24 @@ struct ModInputs {
     std::vector<std::filesystem::path> additional_files;
 };
 
+// A [[patches.instruction]] entry in the mod toml: the new word as value or asm, the game's original word as expect or expect_asm (or read from --rom).
+struct InstructionPatchInput {
+    std::string func;
+    uint32_t vram = 0;
+    std::optional<uint32_t> value;
+    std::string asm_text;
+    std::optional<uint32_t> expect;
+    std::string expect_asm;
+    std::string note;
+};
+
 struct ModConfig {
     ModManifest manifest;
     ModInputs inputs;
+    std::vector<InstructionPatchInput> instruction_patches;
 };
+
+constexpr std::string_view instruction_patches_filename = "instruction_patches.json";
 
 static std::filesystem::path concat_if_not_empty(const std::filesystem::path& parent, const std::filesystem::path& child) {
     if (child.is_absolute()) {
@@ -384,12 +400,10 @@ ModInputs parse_mod_config_inputs(const std::filesystem::path& basedir, const to
     ModInputs ret;
 
     // Elf file
+    // Optional: a mod with only instruction patches has no code (checked in parse_mod_config).
     std::optional<std::string> elf_path_opt = inputs_table["elf_path"].value<std::string>();
     if (elf_path_opt.has_value()) {
         ret.elf_path = concat_if_not_empty(basedir, elf_path_opt.value());
-    }
-    else {
-        throw toml::parse_error("Mod toml input section is missing elf file", inputs_table.source());
     }
 
     // Output NRM file
@@ -416,13 +430,9 @@ ModInputs parse_mod_config_inputs(const std::filesystem::path& basedir, const to
         const toml::array& array = *data_reference_syms_file_data.as_array();
         ret.data_reference_syms_file_paths = get_toml_path_array(array, basedir);
     }
-    else {
-        if (data_reference_syms_file_data) {
-            throw toml::parse_error("Mod toml input section is missing data reference symbol file list", inputs_table.source());
-        }
-        else {
-            throw toml::parse_error("Invalid data reference symbol file list", data_reference_syms_file_data.node()->source());
-        }
+    // Optional: a mod with no data references (one of only instruction patches) needs none.
+    else if (data_reference_syms_file_data) {
+        throw toml::parse_error("Invalid data reference symbol file list", data_reference_syms_file_data.node()->source());
     }
 
     // Additional files (optional)
@@ -468,6 +478,37 @@ ModConfig parse_mod_config(const std::filesystem::path& config_path, bool& good)
         ret.manifest = parse_mod_config_manifest(basedir, manifest_table);
         // Parse the inputs.
         ret.inputs = parse_mod_config_inputs(basedir, inputs_table);
+
+        // Instruction patches.
+        if (const toml::array* patches = toml_data["patches"]["instruction"].as_array()) {
+            for (const toml::node& el : *patches) {
+                const toml::table* t = el.as_table();
+                if (t == nullptr) {
+                    throw toml::parse_error("Invalid instruction patch entry", el.source());
+                }
+                InstructionPatchInput p{};
+                p.func = read_toml_value<std::string_view>(*t, "func", true);
+                p.vram = static_cast<uint32_t>(read_toml_value<int64_t>(*t, "vram", true));
+                p.value = (*t)["value"].value<uint32_t>();
+                p.asm_text = (*t)["asm"].value_or(std::string{});
+                p.expect = (*t)["expect"].value<uint32_t>();
+                p.expect_asm = (*t)["expect_asm"].value_or(std::string{});
+                p.note = (*t)["note"].value_or(std::string{});
+                if (p.value.has_value() == !p.asm_text.empty()) {
+                    throw toml::parse_error("Instruction patch needs exactly one of value or asm", el.source());
+                }
+                if (p.expect.has_value() && !p.expect_asm.empty()) {
+                    throw toml::parse_error("Instruction patch has both expect and expect_asm", el.source());
+                }
+                if (p.vram & 3) {
+                    throw toml::parse_error("Instruction patch is not word-aligned", el.source());
+                }
+                ret.instruction_patches.push_back(std::move(p));
+            }
+        }
+        if (ret.inputs.elf_path.empty() && ret.instruction_patches.empty()) {
+            throw toml::parse_error("Mod toml input section is missing elf file", inputs_table.source());
+        }
     }
     catch (const toml::parse_error& err) {
         std::cerr << "Syntax error parsing toml: " << config_path << " (" << err.source().begin <<  "):\n" << err.description() << std::endl;
@@ -1017,17 +1058,174 @@ N64Recomp::Context build_mod_context(const N64Recomp::Context& input_context, bo
     return ret;
 }
 
+// Assembles one MIPS instruction with the mod's GCC (-x assembler). shortcut: branches, jumps and symbols need a relocation and are refused; give those as value.
+static bool assemble_word_uncached(const std::filesystem::path& assembler, const std::filesystem::path& work_dir, const std::string& line, uint32_t& out, std::string& err);
+static bool assemble_word(const std::filesystem::path& assembler, const std::filesystem::path& work_dir, const std::string& line, uint32_t& out, std::string& err) {
+    // Patches repeat a few instruction lines many times (the co-op relocation is 200 entries of 35 distinct lines).
+    static std::unordered_map<std::string, uint32_t> assembled;
+    auto cached = assembled.find(line);
+    if (cached != assembled.end()) {
+        out = cached->second;
+        return true;
+    }
+    if (!assemble_word_uncached(assembler, work_dir, line, out, err)) {
+        return false;
+    }
+    assembled.emplace(line, out);
+    return true;
+}
+
+static bool assemble_word_uncached(const std::filesystem::path& assembler, const std::filesystem::path& work_dir, const std::string& line, uint32_t& out, std::string& err) {
+    const std::filesystem::path src = work_dir / "patch_insn.s";
+    const std::filesystem::path obj = work_dir / "patch_insn.o";
+    {
+        std::ofstream f{ src };
+        f << ".set noreorder\n.set noat\n.text\n" << line << "\n";
+    }
+    std::error_code ec;
+    std::filesystem::remove(obj, ec);
+    std::string cmd = fmt::format("\"{}\" -c -x assembler -mips2 -mabi=32 -EB -mno-abicalls -fno-pic -o \"{}\" \"{}\"", assembler.string(), obj.string(), src.string());
+#ifdef _WIN32
+    // cmd.exe drops the outer quotes of a command that starts with one.
+    cmd = "\"" + cmd + "\"";
+#endif
+    if (std::system(cmd.c_str()) != 0) {
+        err = "the assembler rejected it";
+        return false;
+    }
+    ELFIO::elfio elf;
+    if (!elf.load(obj.string())) {
+        err = "the assembler's output couldn't be read";
+        return false;
+    }
+    bool found = false;
+    for (const auto& section : elf.sections) {
+        const std::string name = section->get_name();
+        if ((name == ".rel.text" || name == ".rela.text") && section->get_size() != 0) {
+            err = "it needs a relocation (a branch, jump or symbol): give its word as value";
+            return false;
+        }
+        if (name == ".text") {
+            const uint8_t* data = reinterpret_cast<const uint8_t*>(section->get_data());
+            const size_t size = section->get_size();
+            if (size < 4 || data == nullptr) {
+                err = "it assembled to nothing";
+                return false;
+            }
+            for (size_t i = 4; i < size; i++) {
+                if (data[i] != 0) {
+                    err = "it assembles to more than one instruction";
+                    return false;
+                }
+            }
+            out = (uint32_t(data[0]) << 24) | (uint32_t(data[1]) << 16) | (uint32_t(data[2]) << 8) | uint32_t(data[3]);
+            found = true;
+        }
+    }
+    if (!found) {
+        err = "the assembler's output has no .text";
+    }
+    return found;
+}
+
+static std::string json_string(const std::string& s) {
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+        }
+        out += c;
+    }
+    return out + "\"";
+}
+
+// Resolves the toml's instruction patches against the function symbols (and the ROM, for expect) and writes instruction_patches.json, the format librecomp loads.
+static bool write_instruction_patches(const ModConfig& config, const N64Recomp::Context& reference_context, const std::filesystem::path& assembler,
+                                      const std::filesystem::path& output_dir, const std::filesystem::path& path) {
+    std::vector<std::string> rows;
+    for (const InstructionPatchInput& p : config.instruction_patches) {
+        auto where = [&p]() { return fmt::format("instruction patch {} 0x{:08X}", p.func, p.vram); };
+        auto func_it = reference_context.functions_by_name.find(p.func);
+        if (func_it == reference_context.functions_by_name.end()) {
+            fmt::print(stderr, "{}: no function {} in the function reference symbols\n", where(), p.func);
+            return false;
+        }
+        const N64Recomp::Function& func = reference_context.functions[func_it->second];
+        const N64Recomp::Section& section = reference_context.sections[func.section_index];
+        if (p.vram < func.vram || (!func.words.empty() && p.vram >= func.vram + func.words.size() * sizeof(uint32_t))) {
+            fmt::print(stderr, "{}: outside the function\n", where());
+            return false;
+        }
+        std::string err;
+        uint32_t value = p.value.value_or(0);
+        if (!p.asm_text.empty() && (assembler.empty() || !assemble_word(assembler, output_dir, p.asm_text, value, err))) {
+            fmt::print(stderr, "{}: can't assemble \"{}\": {}\n", where(), p.asm_text, assembler.empty() ? "no assembler (pass --as <mips gcc>)" : err);
+            return false;
+        }
+        uint32_t expect = 0;
+        const uint32_t index = (p.vram - func.vram) / sizeof(uint32_t);
+        if (p.expect.has_value()) {
+            expect = p.expect.value();
+        }
+        else if (!p.expect_asm.empty()) {
+            if (assembler.empty() || !assemble_word(assembler, output_dir, p.expect_asm, expect, err)) {
+                fmt::print(stderr, "{}: can't assemble \"{}\": {}\n", where(), p.expect_asm, assembler.empty() ? "no assembler (pass --as <mips gcc>)" : err);
+                return false;
+            }
+        }
+        else if (index < func.words.size()) {
+            expect = byteswap(func.words[index]);
+        }
+        else {
+            fmt::print(stderr, "{}: needs expect or expect_asm (or pass --rom <game rom> to read it)\n", where());
+            return false;
+        }
+        if (index < func.words.size() && byteswap(func.words[index]) != expect) {
+            fmt::print(stderr, "{}: the game's instruction there is 0x{:08X}, not the expected 0x{:08X}\n", where(), byteswap(func.words[index]), expect);
+            return false;
+        }
+        std::string row = fmt::format("{{\"func\": {}, \"vram\": \"0x{:08X}\", \"section_rom\": \"0x{:08X}\", \"func_vram\": \"0x{:08X}\", \"expect\": \"0x{:08X}\", \"value\": \"0x{:08X}\"",
+            json_string(p.func), p.vram, section.rom_addr, func.vram, expect, value);
+        if (!p.asm_text.empty()) {
+            row += ", \"asm\": " + json_string(p.asm_text);
+        }
+        if (!p.note.empty()) {
+            row += ", \"note\": " + json_string(p.note);
+        }
+        rows.push_back(row + "}");
+    }
+    std::error_code ec;
+    std::filesystem::remove(output_dir / "patch_insn.s", ec);
+    std::filesystem::remove(output_dir / "patch_insn.o", ec);
+    std::ofstream out{ path, std::ios::binary };
+    out << "{\n  \"instruction_patches\": [\n";
+    for (size_t i = 0; i < rows.size(); i++) {
+        out << "    " << rows[i] << (i + 1 < rows.size() ? ",\n" : "\n");
+    }
+    out << "  ]\n}\n";
+    return out.good();
+}
+
 bool create_mod_zip(const std::filesystem::path& output_dir, const ModConfig& config) {
     std::filesystem::path output_path = output_dir / (config.inputs.mod_filename + ".nrm");
+
+    // The code files only when the mod has code, the generated instruction patches when it has any.
+    std::vector<std::filesystem::path> files{ output_dir / manifest_filename };
+    if (!config.inputs.elf_path.empty()) {
+        files.push_back(output_dir / symbol_filename);
+        files.push_back(output_dir / binary_filename);
+    }
+    if (!config.instruction_patches.empty()) {
+        files.push_back(output_dir / instruction_patches_filename);
+    }
+    files.insert(files.end(), config.inputs.additional_files.begin(), config.inputs.additional_files.end());
 
 #ifdef _WIN32
     std::filesystem::path temp_zip_path = output_path;
     temp_zip_path.replace_extension(".zip");
-    std::string command_string = fmt::format("powershell -command Compress-Archive -Force -CompressionLevel Optimal -DestinationPath '{}' -Path '{}','{}','{}'",
-        temp_zip_path.string(), (output_dir / symbol_filename).string(), (output_dir / binary_filename).string(), (output_dir / manifest_filename).string());
-
-    for (const auto& cur_file : config.inputs.additional_files) {
-        command_string += fmt::format(",'{}'", cur_file.string());
+    std::string command_string = fmt::format("powershell -command Compress-Archive -Force -CompressionLevel Optimal -DestinationPath '{}' -Path ", temp_zip_path.string());
+    for (size_t i = 0; i < files.size(); i++) {
+        command_string += fmt::format("{}'{}'", i == 0 ? "" : ",", files[i].string());
     }
 
     STARTUPINFOA si{};
@@ -1084,12 +1282,7 @@ bool create_mod_zip(const std::filesystem::path& output_dir, const ModConfig& co
     add_arg("-j"); // Junk the paths (store just as the provided filename).
     add_arg("-T"); // Test zip integrity.
     add_arg(output_path.string());
-    add_arg((output_dir / symbol_filename).string());
-    add_arg((output_dir / binary_filename).string());
-    add_arg((output_dir / manifest_filename).string());
-
-    // Add arguments for every additional file in the archive.
-    for (const auto& cur_file : config.inputs.additional_files) {
+    for (const auto& cur_file : files) {
         add_arg(cur_file.string());
     }
 
@@ -1136,9 +1329,25 @@ bool create_mod_zip(const std::filesystem::path& output_dir, const ModConfig& co
 }
 
 int main(int argc, const char** argv) {
-    if (argc != 3) {
-        fmt::print("Usage: {} [mod toml] [output folder]\n", argv[0]);
+    if (argc < 3) {
+        fmt::print("Usage: {} [mod toml] [output folder] [--as <mips gcc>] [--rom <game rom>]\n", argv[0]);
+        fmt::print("  --as assembles [[patches.instruction]] asm / expect_asm; --rom reads expect from the game's ROM (big-endian .z64).\n");
         return EXIT_SUCCESS;
+    }
+
+    std::filesystem::path assembler_path{};
+    std::filesystem::path rom_path{};
+    for (int i = 3; i + 1 < argc; i += 2) {
+        if (std::string_view{ argv[i] } == "--as") {
+            assembler_path = argv[i + 1];
+        }
+        else if (std::string_view{ argv[i] } == "--rom") {
+            rom_path = argv[i + 1];
+        }
+        else {
+            fmt::print(stderr, "Unknown option {}\n", argv[i]);
+            return EXIT_FAILURE;
+        }
     }
 
     bool config_good;
@@ -1164,11 +1373,20 @@ int main(int argc, const char** argv) {
     N64Recomp::Context context{};
 
     // Import symbols from symbols files that were provided.
+    // Kept for the instruction patches, which look functions up by name; with --rom it also holds the game's words.
+    N64Recomp::Context reference_context{};
     {
         // Create a new temporary context to read the function reference symbol file into, since it's the same format as the recompilation symbol file.
-        std::vector<uint8_t> dummy_rom{};
-        N64Recomp::Context reference_context{};
-        if (!N64Recomp::Context::from_symbol_file(config.inputs.func_reference_syms_file_path, std::move(dummy_rom), reference_context, false)) {
+        std::vector<uint8_t> rom{};
+        if (!rom_path.empty()) {
+            std::ifstream rom_file{ rom_path, std::ios::binary };
+            rom.assign(std::istreambuf_iterator<char>(rom_file), {});
+            if (rom.empty()) {
+                fmt::print(stderr, "Failed to read the ROM {}\n", rom_path.string());
+                return EXIT_FAILURE;
+            }
+        }
+        if (!N64Recomp::Context::from_symbol_file(config.inputs.func_reference_syms_file_path, std::move(rom), reference_context, false)) {
             fmt::print(stderr, "Failed to load provided function reference symbol file\n");
             return EXIT_FAILURE;
         }
@@ -1190,6 +1408,22 @@ int main(int argc, const char** argv) {
     // Copy the dependencies and optional dependencies from the config into the context.
     context.add_dependencies(config.manifest.dependencies);
     context.add_dependencies(config.manifest.optional_dependencies);
+
+    if (!config.instruction_patches.empty() &&
+        !write_instruction_patches(config, reference_context, assembler_path, output_dir, output_dir / instruction_patches_filename)) {
+        fmt::print(stderr, "Failed to write the instruction patches\n");
+        return EXIT_FAILURE;
+    }
+
+    // A mod with only instruction patches has no code to build.
+    if (config.inputs.elf_path.empty()) {
+        write_manifest(output_dir / manifest_filename, config.manifest);
+        if (!create_mod_zip(output_dir, config)) {
+            fmt::print(stderr, "Failed to create mod file.\n");
+            return EXIT_FAILURE;
+        }
+        return EXIT_SUCCESS;
+    }
 
     N64Recomp::ElfParsingConfig elf_config {
         .bss_section_suffix = {},
