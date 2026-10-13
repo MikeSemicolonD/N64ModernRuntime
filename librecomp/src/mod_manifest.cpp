@@ -466,9 +466,9 @@ recomp::mods::ModOpenError parse_manifest_config_schema_option(const nlohmann::j
 
             auto precision = config_schema_json.find(config_schema_precision_key);
             if (precision != config_schema_json.end()) {
-                int64_t precision_int64;
-                if (get_to<int64_t>(*precision, precision_int64)) {
-                    option_number.precision = precision_int64;
+                // A non-negative integer parses as unsigned, which get_to<int64_t> rejects.
+                if (precision->is_number_integer()) {
+                    option_number.precision = (int)precision->template get<int64_t>();
                 }
                 else {
                     error_param = config_schema_precision_key;

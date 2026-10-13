@@ -2,6 +2,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -101,6 +102,23 @@ void recomp::overlays::register_static_patch_replays(const StaticPatchHook* hook
     for (size_t i = 0; instructions[i].vram != 0; i++) {
         static_patch_instructions_by_func[static_patch_key(instructions[i].section_rom, instructions[i].func_vram)].push_back(&instructions[i]);
     }
+}
+
+// Instruction patches from mods (instruction_patches.json), applied after the base ones when the function is regenerated; a deque keeps the pointers stable.
+static std::deque<StaticPatchInstruction> mod_patch_instructions;
+
+void recomp::overlays::add_mod_patch_instruction(const StaticPatchInstruction& patch) {
+    mod_patch_instructions.push_back(patch);
+    static_patch_instructions_by_func[static_patch_key(patch.section_rom, patch.func_vram)].push_back(&mod_patch_instructions.back());
+}
+
+void recomp::overlays::clear_mod_patch_instructions() {
+    for (auto& [key, list] : static_patch_instructions_by_func) {
+        std::erase_if(list, [](const StaticPatchInstruction* p) {
+            return std::any_of(mod_patch_instructions.begin(), mod_patch_instructions.end(), [p](const StaticPatchInstruction& m) { return &m == p; });
+        });
+    }
+    mod_patch_instructions.clear();
 }
 
 void recomp::overlays::get_static_patch_replays(uint32_t section_rom, uint32_t func_vram, std::vector<const StaticPatchHook*>& hooks, std::vector<const StaticPatchInstruction*>& instructions) {

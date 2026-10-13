@@ -675,6 +675,11 @@ std::filesystem::path recomp::mods::get_mod_filename(const std::string& mod_id) 
     return mod_context->get_mod_filename(mod_id);
 }
 
+std::vector<char> recomp::mods::read_mod_file(const std::string& mod_id, const std::string& filepath, bool& exists) {
+    std::lock_guard lock { mod_context_mutex };
+    return mod_context->read_mod_file(mod_id, filepath, exists);
+}
+
 recomp_func_t* recomp::mods::get_mod_export(const std::string& mod_id, const std::string& export_name) {
     std::lock_guard lock { mod_context_mutex };
     return mod_context->get_mod_export(mod_id, export_name);
@@ -902,6 +907,7 @@ void recomp::start(const recomp::Configuration& cfg) {
 
     recomp::register_heap_exports();
     recomp::mods::register_config_exports();
+    recomp::mods::register_data_exports();
     recomp::mods::register_hook_exports();
 
     std::thread game_thread{[](ultramodern::renderer::WindowHandle window_handle, uint8_t* rdram) {

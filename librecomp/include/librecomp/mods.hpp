@@ -363,6 +363,8 @@ namespace recomp {
             void unload_mods();
             std::string get_mod_id_from_filename(const std::filesystem::path& mod_filename) const;
             std::filesystem::path get_mod_filename(const std::string& mod_id) const;
+            // A file inside an opened mod (a .nrm zip or a mod folder); exists is false if the mod or the file isn't there.
+            std::vector<char> read_mod_file(const std::string& mod_id, const std::string& filepath, bool& exists) const;
             // Resolve a named export (code or native library) of a loaded mod to a
             // callable recomp function, or nullptr if the mod/export isn't found.
             recomp_func_t* get_mod_export(const std::string& mod_id, const std::string& export_name) const;
@@ -610,6 +612,8 @@ namespace recomp {
 
         void setup_events(size_t num_events);
         void register_event_callback(size_t event_index, size_t mod_index, GenericFunction callback);
+        // True when a loaded mod subscribed to the event, so a caller can skip work it only needs for callbacks.
+        bool event_has_callbacks(size_t event_index);
         void reset_events();
         
         void setup_hooks(size_t num_hook_slots);
@@ -644,6 +648,7 @@ namespace recomp {
         ConfigValueVariant get_mod_config_value(const std::string &mod_id, const std::string &option_id);
         std::string get_mod_id_from_filename(const std::filesystem::path& mod_filename);
         std::filesystem::path get_mod_filename(const std::string& mod_id);
+        std::vector<char> read_mod_file(const std::string& mod_id, const std::string& filepath, bool& exists);
         recomp_func_t* get_mod_export(const std::string& mod_id, const std::string& export_name);
         size_t get_mod_order_index(const std::string& mod_id);
         size_t get_mod_order_index(size_t mod_index);
@@ -655,6 +660,8 @@ namespace recomp {
         DependencyStatus is_dependency_met(size_t mod_index, const std::string& dependency_id);
 
         void register_config_exports();
+        // The recompdata.h collections (hashmaps, hashsets, slotmaps).
+        void register_data_exports();
     }
 };
 

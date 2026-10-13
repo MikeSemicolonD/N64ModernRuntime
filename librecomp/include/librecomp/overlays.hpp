@@ -37,6 +37,8 @@ namespace recomp {
         bool can_replay_static_patches(recomp_func_t* func);
         // The config patches N64Recomp emits in recomp_overlays.inl; both lists end with a zero entry. Re-applied to functions regenerated for mod hooks.
         void register_static_patch_replays(const StaticPatchHook* hooks, const StaticPatchInstruction* instructions);
+        void add_mod_patch_instruction(const StaticPatchInstruction& patch);
+        void clear_mod_patch_instructions();
         void get_static_patch_replays(uint32_t section_rom, uint32_t func_vram, std::vector<const StaticPatchHook*>& hooks, std::vector<const StaticPatchInstruction*>& instructions);
         void read_patch_data(uint8_t* rdram, gpr patch_data_address);
 

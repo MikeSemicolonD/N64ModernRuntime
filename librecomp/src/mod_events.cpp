@@ -55,6 +55,10 @@ void recomp::mods::setup_events(size_t num_events) {
     event_callbacks.resize(num_events);
 }
 
+bool recomp::mods::event_has_callbacks(size_t event_index) {
+    return event_index < event_callbacks.size() && !event_callbacks[event_index].empty();
+}
+
 void recomp::mods::register_event_callback(size_t event_index, size_t mod_index, GenericFunction callback) {
     event_callbacks[event_index].emplace_back(EventCallback{ mod_index, callback });
 }

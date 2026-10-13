@@ -12,6 +12,13 @@
 #include "recompiler/context.h"
 #include "recompiler/live_recompiler.h"
 
+// A regen-list entry that only forces a function to be regenerated (for a mod instruction patch), with no hook slot.
+static constexpr size_t no_hook_slot = static_cast<size_t>(-1);
+
+// Mod instruction patches by (section rom << 32 | function vram), with the original word each replaces, for patching another mod's replacement of the function.
+struct ModInsnPatch { uint32_t vram; uint32_t value; uint32_t expect; };
+static std::unordered_map<uint64_t, std::vector<ModInsnPatch>> mod_insn_patches;
+
 static bool read_json(std::ifstream input_file, nlohmann::json &json_out) {
     if (!input_file.good()) {
         return false;
@@ -1208,6 +1215,15 @@ std::filesystem::path recomp::mods::ModContext::get_mod_filename(const std::stri
     return opened_mods[find_it->second].manifest.mod_root_path;
 }
 
+std::vector<char> recomp::mods::ModContext::read_mod_file(const std::string& mod_id, const std::string& filepath, bool& exists) const {
+    exists = false;
+    auto find_it = opened_mods_by_id.find(mod_id);
+    if (find_it == opened_mods_by_id.end() || !opened_mods[find_it->second].manifest.file_handle) {
+        return {};
+    }
+    return opened_mods[find_it->second].manifest.file_handle->read_file(filepath, exists);
+}
+
 recomp_func_t* recomp::mods::ModContext::get_mod_export(const std::string& mod_id, const std::string& export_name) const {
     auto find_it = opened_mods_by_id.find(mod_id);
     if (find_it == opened_mods_by_id.end()) {
@@ -1689,6 +1705,76 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
         return ret;
     }
 
+    // Instruction patches a mod ships in instruction_patches.json: each patched function is regenerated with LiveRecomp (like a hooked one) with the patch applied.
+    std::vector<HookDefinition> patched_insn_funcs{};
+    mod_insn_patches.clear();
+    {
+        std::unordered_map<uint64_t, std::pair<uint32_t, std::string>> patch_owner{};
+        for (size_t mod_index : active_mods) {
+            auto& mod = opened_mods[mod_index];
+            bool exists = false;
+            std::vector<char> text = mod.manifest.file_handle ? mod.manifest.file_handle->read_file("instruction_patches.json", exists) : std::vector<char>{};
+            if (!exists) {
+                continue;
+            }
+            auto fail = [&](const std::string& why) { ret.emplace_back(mod.manifest.mod_id, ModLoadError::FailedToLoadCode, "instruction_patches.json: " + why); };
+            nlohmann::json j = nlohmann::json::parse(text.begin(), text.end(), nullptr, false);
+            if (j.is_discarded() || !j.is_object() || !j.contains("instruction_patches") || !j["instruction_patches"].is_array()) {
+                fail("not an object with an instruction_patches array");
+                continue;
+            }
+            for (const auto& e : j["instruction_patches"]) {
+                if (!e.is_object() || !e.contains("section_rom") || !e.contains("func_vram") || !e.contains("vram") || !e.contains("value") || !e.contains("expect")) {
+                    fail("an entry needs section_rom, func_vram, vram, value and expect");
+                    break;
+                }
+                const StaticPatchInstruction patch{ e["section_rom"].get<uint32_t>(), e["func_vram"].get<uint32_t>(), e["vram"].get<uint32_t>(), e["value"].get<uint32_t>() };
+                const uint32_t expect = e["expect"].get<uint32_t>();
+                std::stringstream where{};
+                where << std::hex << "0x" << patch.vram << " in function 0x" << patch.func_vram << " (" << e.value("func", std::string{}) << ")";
+                auto section_it = section_vrom_map.find(patch.section_rom);
+                FuncEntry func_entry{};
+                if (section_it == section_vrom_map.end() ||
+                    !recomp::overlays::get_func_entry_by_section_index_function_offset(section_it->second, patch.func_vram - recomp::overlays::get_section_ram_addr(section_it->second), func_entry) ||
+                    func_entry.rom_size == 0 || (patch.vram & 3) != 0 || patch.vram < patch.func_vram || patch.vram >= patch.func_vram + func_entry.rom_size) {
+                    fail("no such function or address: " + where.str());
+                    break;
+                }
+                const uint32_t rom_offset = patch.section_rom + (patch.vram - recomp::overlays::get_section_ram_addr(section_it->second));
+                if (rom_offset + 4 > decompressed_rom.size() || byteswap(*reinterpret_cast<const uint32_t*>(decompressed_rom.data() + rom_offset)) != expect) {
+                    fail("the game's instruction at " + where.str() + " is not the expected one (stale patch file?)");
+                    break;
+                }
+                const uint64_t key = (uint64_t(patch.section_rom) << 32) | patch.vram;
+                auto owner_it = patch_owner.find(key);
+                if (owner_it != patch_owner.end()) {
+                    if (owner_it->second.first != patch.value) {
+                        fail("conflicts with " + owner_it->second.second + " at " + where.str());
+                        break;
+                    }
+                    continue;
+                }
+                patch_owner.emplace(key, std::make_pair(patch.value, mod.manifest.mod_id));
+                recomp::overlays::add_mod_patch_instruction(patch);
+                mod_insn_patches[(uint64_t(patch.section_rom) << 32) | patch.func_vram].push_back({ patch.vram, patch.value, expect });
+                HookDefinition def{ .section_rom = patch.section_rom, .function_vram = patch.func_vram, .at_return = false };
+                if (std::find(patched_insn_funcs.begin(), patched_insn_funcs.end(), def) == patched_insn_funcs.end()) {
+                    patched_insn_funcs.push_back(def);
+                }
+            }
+        }
+        if (!patch_owner.empty()) {
+            printf("Mod instruction patches: %zu in %zu functions\n", patch_owner.size(), patched_insn_funcs.size());
+        }
+    }
+
+    // Exit early if errors were found.
+    if (!ret.empty()) {
+        recomp::overlays::clear_mod_patch_instructions();
+        unload_mods();
+        return ret;
+    }
+
     // Apply a ROM patch if one was found.
     if (rom_patch_mod_index != (size_t)-1) {
         auto& mod = opened_mods[rom_patch_mod_index];
@@ -1847,6 +1933,19 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
             unprocessed_hooks.emplace_back(std::make_pair(def, index));
         }
         recomp::mods::set_hook_type(index, def.at_return);
+    }
+
+    // A function a mod replaces carries the patches in its replacement (load_mod_code), so it isn't regenerated.
+    for (size_t mod_index : loaded_code_mods) {
+        for (const auto& replacement : opened_mods[mod_index].recompiler_context->replacements) {
+            const HookDefinition def{ .section_rom = replacement.original_section_vrom, .function_vram = replacement.original_vram, .at_return = false };
+            std::erase(patched_insn_funcs, def);
+        }
+    }
+
+    // Instruction-patched functions are regenerated too; no_hook_slot marks an entry that only forces the regeneration.
+    for (const HookDefinition& def : patched_insn_funcs) {
+        unprocessed_hooks.emplace_back(std::make_pair(def, no_hook_slot));
     }
 
     if (!unprocessed_hooks.empty()) {
@@ -2049,7 +2148,17 @@ std::vector<recomp::mods::ModLoadErrorDetails> build_regen_list(
             }
         }
 
-        if (cur_func_is_base_patched) {
+        if (cur_hook_slot_index == no_hook_slot) {
+            if (cur_func_is_base_patched) {
+                std::stringstream error_param_stream{};
+                error_param_stream << std::hex << "func: 0x" << cur_hook_def.function_vram << " is replaced by the base patches";
+                ret.emplace_back(ModLoadErrorDetails{
+                    "", ModLoadError::FailedToLoadCode, error_to_string(CodeModLoadError::CannotBeHooked) + ":" + error_param_stream.str()
+                });
+                return ret;
+            }
+        }
+        else if (cur_func_is_base_patched) {
             regenlist.patched_hooks.emplace_back(std::make_pair(cur_base_patched, cur_hook));
         }
         else {
@@ -2409,6 +2518,26 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t* 
         if (find_return_it != hook_slots.end()) {
             return_func_hooks.emplace(replacement.func_index, find_return_it->second);
             processed_hook_slots[find_return_it->second] = true;
+        }
+    }
+
+    // Another mod's instruction patches follow a function into this mod's replacement of it, where the replacement still has the game's original instruction at that offset.
+    const bool offline = mod.manifest.mod_root_path.filename().string().ends_with(".offline.nrm");
+    for (const auto& replacement : mod.recompiler_context->replacements) {
+        auto patches_it = mod_insn_patches.find((uint64_t(replacement.original_section_vrom) << 32) | replacement.original_vram);
+        if (patches_it == mod_insn_patches.end()) {
+            continue;
+        }
+        N64Recomp::Function& func = mod.recompiler_context->functions[replacement.func_index];
+        for (const ModInsnPatch& patch : patches_it->second) {
+            const size_t index = (patch.vram - replacement.original_vram) / sizeof(uint32_t);
+            if (offline || index >= func.words.size() || byteswap(func.words[index]) != patch.expect) {
+                std::stringstream where{};
+                where << std::hex << "replaces function 0x" << replacement.original_vram << ", but its copy doesn't keep the original instruction at 0x" << patch.vram << " that another mod's instruction_patches.json patches";
+                error_param = where.str();
+                return CodeModLoadError::ModConflict;
+            }
+            func.words[index] = byteswap(patch.value);
         }
     }
 
