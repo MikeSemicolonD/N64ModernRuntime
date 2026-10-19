@@ -54,6 +54,7 @@ extern "C" ULTRAMODERN_OVERRIDABLE void osSpTaskStartGo_recomp(uint8_t* rdram, r
 
 extern "C" void osSpTaskYield_recomp(uint8_t* rdram, recomp_context* ctx) {
     // Ignore yield requests (acts as if the task completed before it received the yield request)
+#ifndef NDEBUG
     static int n = 0;
     ++n;
     if (n <= 8 || (n & 31) == 0) {
@@ -61,10 +62,12 @@ extern "C" void osSpTaskYield_recomp(uint8_t* rdram, recomp_context* ctx) {
             n, (uint32_t)ctx->r31);
         fflush(stderr);
     }
+#endif
 }
 
 extern "C" void osSpTaskYielded_recomp(uint8_t* rdram, recomp_context* ctx) {
     // Task yield requests are ignored, so always return 0 as tasks will never be yielded
+#ifndef NDEBUG
     static int n = 0;
     ++n;
     if (n <= 8 || (n & 31) == 0) {
@@ -72,6 +75,7 @@ extern "C" void osSpTaskYielded_recomp(uint8_t* rdram, recomp_context* ctx) {
             n, (uint32_t)ctx->r31);
         fflush(stderr);
     }
+#endif
     ctx->r2 = 0;
 }
 

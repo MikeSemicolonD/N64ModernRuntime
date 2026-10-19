@@ -8,8 +8,8 @@
 namespace recomp {
     // 512GB (kseg0 size)
     constexpr size_t mem_size = 512ULL * 1024ULL * 1024ULL;
-    // 4GB (the full address space)
-    constexpr size_t allocation_size = 4096ULL * 1024ULL * 1024ULL;
+    // 4GB (the full address space); 32-bit hosts reserve only mem_size and mask guest addresses instead (RDRAM_OFFSET).
+    constexpr size_t allocation_size = sizeof(void*) == 4 ? mem_size : (size_t)(4096ULL * 1024ULL * 1024ULL);
     // We need a place in rdram to hold the PI handles, so pick an address in extended rdram
     constexpr int32_t cart_handle = 0x80800000;
     constexpr int32_t drive_handle = (int32_t)(cart_handle + sizeof(OSPiHandle));

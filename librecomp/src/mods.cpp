@@ -83,6 +83,12 @@ bool get_to_vec(const nlohmann::json& val, std::vector<T2>& out) {
 // MSVC/GCC/Clang ARM64
 #elif defined(__ARM_ARCH_ISA_A64)
 #   define IS_ARM64
+// MSVC/GCC/Clang x86 (32-bit)
+#elif defined(_M_IX86) || defined(__i386__)
+#   define IS_X86
+// GCC/Clang 32-bit ARM, built in ARM mode (-marm) so function pointers are plain addresses
+#elif defined(__arm__) && !defined(__thumb__)
+#   define IS_ARM32
 #else
 #   error "Unsupported architecture!"
 #endif
@@ -242,25 +248,48 @@ private:
     uint32_t api_version;
 };
 
-void unprotect(void* target_func, uint64_t* old_flags) {
-    // Align the address to a page boundary.
-    uintptr_t page_start = (uintptr_t)target_func;
-    int page_size = getpagesize();
-    page_start = (page_start / page_size) * page_size;
+// The 16-byte patch can start near the end of a page and run into the next one, so cover every page it touches.
+static void patch_pages(void* target_func, uintptr_t* page_start, size_t* length) {
+    const uintptr_t page_size = (uintptr_t)getpagesize();
+    const uintptr_t start = (uintptr_t)target_func;
+    *page_start = (start / page_size) * page_size;
+    const uintptr_t end = ((start + sizeof(recomp::mods::PatchData::replaced_bytes) + page_size - 1) / page_size) * page_size;
+    *length = end - *page_start;
+}
 
-    int result = mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE);
+void unprotect(void* target_func, uint64_t* old_flags) {
+    uintptr_t page_start;
+    size_t length;
+    patch_pages(target_func, &page_start, &length);
+#if defined(__ANDROID__)
+    // SELinux denies execmod, so a written page of the library can never be executable again; swap in an anonymous copy first.
+    void* copy = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (copy != MAP_FAILED) {
+        memcpy(copy, (void*)page_start, length);
+        mprotect(copy, length, PROT_READ | PROT_WRITE | PROT_EXEC);
+        if (mremap(copy, length, length, MREMAP_MAYMOVE | MREMAP_FIXED, (void*)page_start) == MAP_FAILED) {
+            munmap(copy, length);
+        }
+    }
+    int result = mprotect((void*)page_start, length, PROT_READ | PROT_WRITE | PROT_EXEC);
+    if (result != 0) {
+        result = mprotect((void*)page_start, length, PROT_READ | PROT_WRITE);
+    }
+#else
+    int result = mprotect((void*)page_start, length, PROT_READ | PROT_WRITE);
+#endif
     *old_flags = 0;
     (void)result;
 }
 
 void protect(void* target_func, uint64_t old_flags) {
-    // Align the address to a page boundary.
-    uintptr_t page_start = (uintptr_t)target_func;
-    int page_size = getpagesize();
-    page_start = (page_start / page_size) * page_size;
-
-    int result = mprotect((void*)page_start, page_size, PROT_READ | PROT_EXEC);
+    uintptr_t page_start;
+    size_t length;
+    patch_pages(target_func, &page_start, &length);
+    int result = mprotect((void*)page_start, length, PROT_READ | PROT_EXEC);
     (void)result;
+    // ARM's instruction cache doesn't see the patched bytes on its own; a no-op on x86.
+    __builtin___clear_cache((char*)target_func, (char*)target_func + sizeof(recomp::mods::PatchData::replaced_bytes));
 }
 #endif
 
@@ -609,6 +638,25 @@ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replac
     std::visit(overloaded {
         [&write_bytes](recomp_func_t* native_func) {
            write_bytes(ldr_x2_8__br_x2, sizeof(ldr_x2_8__br_x2));
+           write_bytes(&native_func, sizeof(&native_func));
+        }
+    }, replacement_func);
+#elif defined(IS_X86)
+    static const uint8_t mov_eax = 0xB8;
+    static const uint8_t jmp_eax[] = {0xFF, 0xE0};
+    std::visit(overloaded {
+        [&write_bytes](recomp_func_t* native_func) {
+           write_bytes(&mov_eax, sizeof(mov_eax));
+           write_bytes(&native_func, sizeof(&native_func));
+           write_bytes(jmp_eax, sizeof(jmp_eax));
+        }
+    }, replacement_func);
+#elif defined(IS_ARM32)
+    // ldr pc, [pc, #-4] loads the word right after it (pc reads as this instruction + 8).
+    static const uint8_t ldr_pc_next[] = {0x04, 0xF0, 0x1F, 0xE5};
+    std::visit(overloaded {
+        [&write_bytes](recomp_func_t* native_func) {
+           write_bytes(ldr_pc_next, sizeof(ldr_pc_next));
            write_bytes(&native_func, sizeof(&native_func));
         }
     }, replacement_func);

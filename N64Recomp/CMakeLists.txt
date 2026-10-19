@@ -205,3 +205,7 @@ target_include_directories(LiveRecompTest PRIVATE
 )
 
 target_link_libraries(LiveRecompTest LiveRecomp)
+
+# Prints one hash per single-instruction case; diff a 64-bit and a 32-bit build's output to check the 32-bit lowering.
+add_executable(LiveRecompDiffTest EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/LiveRecomp/live_diff_test.cpp)
+target_link_libraries(LiveRecompDiffTest LiveRecomp)

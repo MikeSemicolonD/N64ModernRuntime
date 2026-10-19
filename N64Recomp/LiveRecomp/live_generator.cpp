@@ -35,6 +35,30 @@ namespace Registers {
     constexpr int arithmetic_temp4 = SLJIT_R3;
 }
 
+// 32-bit hosts keep each 64-bit MIPS value as a lo/hi word pair, hold hi/lo in the stack frame, and pass rare ops to C helpers that mirror the 64-bit JIT's results.
+constexpr bool gpr_pairs = sizeof(sljit_sw) == 4;
+
+namespace PairFrame {
+    // Helper scratch: operand a = words 0-1, operand b = words 2-3, results = words 4-7.
+    constexpr sljit_sw scratch = 0;
+    constexpr sljit_sw hi = 32;
+    constexpr sljit_sw lo = 40;
+    constexpr sljit_sw size = 48;
+}
+
+// Guest addresses wrap into the 512MB rdram window on 32-bit hosts (RDRAM_OFFSET in recomp.h).
+constexpr sljit_sw rdram_mask = 0x1FFFFFFF;
+
+// Loads the real rdram pointer into reg; 64-bit hosts keep Registers::rdram biased by rdram_offset.
+static void emit_rdram_arg(sljit_compiler* compiler, sljit_s32 reg) {
+    if constexpr (gpr_pairs) {
+        sljit_emit_op1(compiler, SLJIT_MOV, reg, 0, Registers::rdram, 0);
+    }
+    else {
+        sljit_emit_op2(compiler, SLJIT_ADD, reg, 0, Registers::rdram, 0, SLJIT_IMM, (sljit_sw)rdram_offset);
+    }
+}
+
 struct InnerCall {
     size_t target_func_index;
     sljit_jump* jump;
@@ -368,12 +392,24 @@ bool get_operand_values(N64Recomp::Operand operand, const N64Recomp::Instruction
             outw = 0;
             break;
         case Operand::Hi:
-            out = Registers::hi;
-            outw = 0;
+            if constexpr (gpr_pairs) {
+                out = SLJIT_MEM1(SLJIT_SP);
+                outw = PairFrame::hi;
+            }
+            else {
+                out = Registers::hi;
+                outw = 0;
+            }
             break;
         case Operand::Lo:
-            out = Registers::lo;
-            outw = 0;
+            if constexpr (gpr_pairs) {
+                out = SLJIT_MEM1(SLJIT_SP);
+                outw = PairFrame::lo;
+            }
+            else {
+                out = Registers::lo;
+                outw = 0;
+            }
             break;
         case Operand::Zero:
             out = SLJIT_IMM;
@@ -394,6 +430,415 @@ bool outputs_to_zero(N64Recomp::Operand output, const N64Recomp::InstructionCont
         return true;
     }
     return false;
+}
+
+// A 64-bit operand on a 32-bit host. Operands without a high word (u32l floats, cop1cs) only read or write lo.
+struct OperandPair {
+    sljit_s32 lo;
+    sljit_sw low;
+    sljit_s32 hi;
+    sljit_sw hiw;
+    bool has_hi;
+};
+
+static OperandPair to_pair(N64Recomp::Operand operand, sljit_sw value, sljit_sw valuew) {
+    if (is_fpr_u32l(operand) || operand == N64Recomp::Operand::Cop1cs) {
+        return { (sljit_s32)value, valuew, SLJIT_IMM, 0, false };
+    }
+    if (value == SLJIT_IMM) {
+        return { SLJIT_IMM, valuew, SLJIT_IMM, valuew < 0 ? -1 : 0, true };
+    }
+    return { (sljit_s32)value, valuew, (sljit_s32)value, valuew + 4, true };
+}
+
+static OperandPair scratch_pair(int index) {
+    return { SLJIT_MEM1(SLJIT_SP), PairFrame::scratch + index * 8, SLJIT_MEM1(SLJIT_SP), PairFrame::scratch + index * 8 + 4, true };
+}
+
+static void move_pair(sljit_compiler* c, const OperandPair& dst, const OperandPair& src) {
+    sljit_emit_op1(c, SLJIT_MOV, dst.lo, dst.low, src.lo, src.low);
+    if (dst.has_hi) {
+        sljit_emit_op1(c, SLJIT_MOV, dst.hi, dst.hiw, src.has_hi ? src.hi : SLJIT_IMM, src.has_hi ? src.hiw : 0);
+    }
+}
+
+// Stores the 32-bit value in reg to dst, sign extending into the high word. Clobbers reg.
+static void store_s32_pair(sljit_compiler* c, const OperandPair& dst, sljit_s32 reg) {
+    sljit_emit_op1(c, SLJIT_MOV, dst.lo, dst.low, reg, 0);
+    if (dst.has_hi) {
+        sljit_emit_op2(c, SLJIT_ASHR, reg, 0, reg, 0, SLJIT_IMM, 31);
+        sljit_emit_op1(c, SLJIT_MOV, dst.hi, dst.hiw, reg, 0);
+    }
+}
+
+static void store_u32_pair(sljit_compiler* c, const OperandPair& dst, sljit_s32 reg) {
+    sljit_emit_op1(c, SLJIT_MOV, dst.lo, dst.low, reg, 0);
+    if (dst.has_hi) {
+        sljit_emit_op1(c, SLJIT_MOV, dst.hi, dst.hiw, SLJIT_IMM, 0);
+    }
+}
+
+// Sets reg to 1 if the 64-bit comparison a <type> b holds and 0 otherwise. Clobbers tmp.
+static void emit_compare_pair(sljit_compiler* c, N64Recomp::BinaryOpType type, bool is_signed, const OperandPair& a, const OperandPair& b, sljit_s32 reg, sljit_s32 tmp) {
+    using N64Recomp::BinaryOpType;
+    if (type == BinaryOpType::Equal || type == BinaryOpType::NotEqual) {
+        sljit_emit_op1(c, SLJIT_MOV, reg, 0, a.lo, a.low);
+        sljit_emit_op1(c, SLJIT_MOV, tmp, 0, a.hi, a.hiw);
+        sljit_emit_op2(c, SLJIT_XOR, reg, 0, reg, 0, b.lo, b.low);
+        sljit_emit_op2(c, SLJIT_XOR, tmp, 0, tmp, 0, b.hi, b.hiw);
+        sljit_emit_op2(c, SLJIT_OR | SLJIT_SET_Z, reg, 0, reg, 0, tmp, 0);
+        sljit_emit_op_flags(c, SLJIT_MOV, reg, 0, type == BinaryOpType::Equal ? SLJIT_ZERO : SLJIT_NOT_ZERO);
+        return;
+    }
+    // Unequal high words decide the result with a strict comparison; equal ones fall back to an unsigned low word comparison.
+    // sljit sets an odd condition's flag through its even partner, hence SLJIT_SET(cond & ~1).
+    sljit_s32 hi_cond;
+    sljit_s32 lo_cond;
+    switch (type) {
+        case BinaryOpType::Less:
+            hi_cond = is_signed ? SLJIT_SIG_LESS : SLJIT_LESS;
+            lo_cond = SLJIT_LESS;
+            break;
+        case BinaryOpType::LessEq:
+            hi_cond = is_signed ? SLJIT_SIG_LESS : SLJIT_LESS;
+            lo_cond = SLJIT_LESS_EQUAL;
+            break;
+        case BinaryOpType::Greater:
+            hi_cond = is_signed ? SLJIT_SIG_GREATER : SLJIT_GREATER;
+            lo_cond = SLJIT_GREATER;
+            break;
+        default:
+            hi_cond = is_signed ? SLJIT_SIG_GREATER : SLJIT_GREATER;
+            lo_cond = SLJIT_GREATER_EQUAL;
+            break;
+    }
+    sljit_emit_op1(c, SLJIT_MOV, tmp, 0, a.hi, a.hiw);
+    sljit_jump* hi_equal = sljit_emit_cmp(c, SLJIT_EQUAL, tmp, 0, b.hi, b.hiw);
+    sljit_emit_op2u(c, SLJIT_SUB | SLJIT_SET(hi_cond & ~1), tmp, 0, b.hi, b.hiw);
+    sljit_emit_op_flags(c, SLJIT_MOV, reg, 0, hi_cond);
+    sljit_jump* done = sljit_emit_jump(c, SLJIT_JUMP);
+    sljit_set_label(hi_equal, sljit_emit_label(c));
+    sljit_emit_op1(c, SLJIT_MOV, tmp, 0, a.lo, a.low);
+    sljit_emit_op2u(c, SLJIT_SUB | SLJIT_SET(lo_cond & ~1), tmp, 0, b.lo, b.low);
+    sljit_emit_op_flags(c, SLJIT_MOV, reg, 0, lo_cond);
+    sljit_set_label(done, sljit_emit_label(c));
+}
+
+static uint64_t scratch_u64(const uint32_t* s) {
+    return uint64_t(s[0]) | (uint64_t(s[1]) << 32);
+}
+
+static void set_scratch_u64(uint32_t* s, uint64_t value) {
+    s[0] = uint32_t(value);
+    s[1] = uint32_t(value >> 32);
+}
+
+static uint64_t sext32(uint64_t value) {
+    return uint64_t(int64_t(int32_t(uint32_t(value))));
+}
+
+enum PairSlowOp : uint32_t { SlowSll64, SlowSrl64, SlowSra64, SlowSra32, SlowMult, SlowMultu, SlowDmult, SlowDmultu, SlowDiv, SlowDivu, SlowDdiv, SlowDdivu };
+
+// Operands in scratch words 0-3; writes the result (or lo) to words 4-5 and hi to words 6-7.
+static void pair_slow_op(uint32_t* s, uint32_t op) {
+    uint64_t a = scratch_u64(s);
+    uint64_t b = scratch_u64(s + 2);
+    uint64_t r0 = 0;
+    uint64_t r1 = 0;
+    switch (op) {
+        case SlowSll64: r0 = a << (b & 63); break;
+        case SlowSrl64: r0 = a >> (b & 63); break;
+        case SlowSra64: r0 = uint64_t(int64_t(a) >> (b & 63)); break;
+        // The input isn't truncated first, so high bits shift into the result as on hardware.
+        case SlowSra32: r0 = sext32(uint64_t(int64_t(a) >> (b & 31))); break;
+        // Signed 32-bit multiplication is 64 x 35 bits, as in the 64-bit JIT.
+        case SlowMult: {
+            uint64_t p = a * uint64_t(int64_t(b << 29) >> 29);
+            r0 = sext32(p);
+            r1 = uint64_t(int64_t(p) >> 32);
+            break;
+        }
+        case SlowMultu: {
+            uint64_t p = uint64_t(uint32_t(a)) * uint64_t(uint32_t(b));
+            r0 = sext32(p);
+            r1 = uint64_t(int64_t(p) >> 32);
+            break;
+        }
+        case SlowDmult: {
+            int64_t lo, hi;
+            DMULT(int64_t(a), int64_t(b), &lo, &hi);
+            r0 = uint64_t(lo);
+            r1 = uint64_t(hi);
+            break;
+        }
+        case SlowDmultu: DMULTU(a, b, &r0, &r1); break;
+        case SlowDiv: {
+            int64_t n = int32_t(uint32_t(a));
+            int64_t d = int32_t(uint32_t(b));
+            if (d == 0) {
+                r0 = uint64_t((~n >> 63) | 1);
+                r1 = uint64_t(n);
+            }
+            else {
+                r0 = sext32(uint64_t(n / d));
+                r1 = sext32(uint64_t(n % d));
+            }
+            break;
+        }
+        case SlowDivu: {
+            uint32_t n = uint32_t(a);
+            uint32_t d = uint32_t(b);
+            if (d == 0) {
+                r0 = ~0ull;
+                r1 = sext32(n);
+            }
+            else {
+                r0 = sext32(n / d);
+                r1 = sext32(n % d);
+            }
+            break;
+        }
+        case SlowDdiv: {
+            int64_t n = int64_t(a);
+            int64_t d = int64_t(b);
+            if (n == INT64_MIN && d == -1) {
+                d = 1;
+            }
+            if (d == 0) {
+                r0 = uint64_t((~n >> 63) | 1);
+                r1 = a;
+            }
+            else {
+                r0 = uint64_t(n / d);
+                r1 = uint64_t(n % d);
+            }
+            break;
+        }
+        case SlowDdivu: {
+            if (b == 0) {
+                r0 = ~0ull;
+                r1 = a;
+            }
+            else {
+                r0 = a / b;
+                r1 = a % b;
+            }
+            break;
+        }
+    }
+    set_scratch_u64(s + 4, r0);
+    set_scratch_u64(s + 6, r1);
+}
+
+enum PairMemOp : uint32_t { MemLWL, MemLWR, MemLDL, MemLDR, MemSWL, MemSWR, MemSDL, MemSDR };
+
+// Unaligned access with the 64-bit JIT's semantics. Address in scratch word 0, the register value in words 2-3; loads write words 4-5.
+static void pair_unaligned_op(uint8_t* rdram, uint32_t* s, uint32_t op) {
+    uint32_t addr = s[0];
+    uint64_t v = scratch_u64(s + 2);
+    auto word = [rdram](uint32_t a) -> uint32_t& { return *(uint32_t*)(rdram + RDRAM_OFFSET(a)); };
+    auto dword = [&word](uint32_t a) { return (uint64_t(word(a)) << 32) | word(a + 4); };
+    auto set_dword = [&word](uint32_t a, uint64_t value) {
+        word(a) = uint32_t(value >> 32);
+        word(a + 4) = uint32_t(value);
+    };
+    uint32_t aligned4 = addr & ~3u;
+    uint32_t aligned8 = addr & ~7u;
+    uint64_t mask;
+    uint32_t shift;
+    switch (op) {
+        case MemLWL:
+            shift = (addr & 3) * 8;
+            mask = sext32(uint32_t(0xFFFFFFFFu << shift));
+            set_scratch_u64(s + 4, (v & ~mask) | (sext32(sext32(word(aligned4)) << shift) & mask));
+            break;
+        case MemLWR:
+            shift = (3 - (addr & 3)) * 8;
+            mask = sext32(uint32_t(0xFFFFFFFFu >> shift));
+            set_scratch_u64(s + 4, (v & ~mask) | ((sext32(word(aligned4)) >> shift) & mask));
+            break;
+        case MemLDL:
+            shift = (addr & 7) * 8;
+            mask = ~0ull << shift;
+            set_scratch_u64(s + 4, (v & ~mask) | ((dword(aligned8) << shift) & mask));
+            break;
+        case MemLDR:
+            shift = (7 - (addr & 7)) * 8;
+            mask = ~0ull >> shift;
+            set_scratch_u64(s + 4, (v & ~mask) | ((dword(aligned8) >> shift) & mask));
+            break;
+        case MemSWL:
+            shift = (addr & 3) * 8;
+            mask = uint64_t(0xFFFFFFFFu >> shift);
+            word(aligned4) = uint32_t((word(aligned4) & ~mask) | ((v >> shift) & mask));
+            break;
+        case MemSWR:
+            shift = (3 - (addr & 3)) * 8;
+            mask = uint64_t(uint32_t(0xFFFFFFFFu << shift));
+            word(aligned4) = uint32_t((word(aligned4) & ~mask) | ((v << shift) & mask));
+            break;
+        case MemSDL:
+            shift = (addr & 7) * 8;
+            mask = ~0ull >> shift;
+            set_dword(aligned8, (dword(aligned8) & ~mask) | ((v >> shift) & mask));
+            break;
+        case MemSDR:
+            shift = (7 - (addr & 7)) * 8;
+            mask = ~0ull << shift;
+            set_dword(aligned8, (dword(aligned8) & ~mask) | ((v << shift) & mask));
+            break;
+    }
+}
+
+static void pair_d_from_l(uint32_t* s) {
+    double d = double(int64_t(scratch_u64(s)));
+    memcpy(s + 4, &d, sizeof(d));
+}
+
+static void pair_s_from_l(uint32_t* s) {
+    float f = float(int64_t(scratch_u64(s)));
+    memcpy(s + 4, &f, sizeof(f));
+}
+
+static void pair_l_from_s(uint32_t* s, int64_t (*func)(float)) {
+    float f;
+    memcpy(&f, s, sizeof(f));
+    set_scratch_u64(s + 4, uint64_t(func(f)));
+}
+
+static void pair_l_from_d(uint32_t* s, int64_t (*func)(double)) {
+    double d;
+    memcpy(&d, s, sizeof(d));
+    set_scratch_u64(s + 4, uint64_t(func(d)));
+}
+
+// Truncation with cvttss2si/cvttsd2si's out-of-range result, as the 64-bit JIT emits.
+static int64_t pair_trunc_l_s(float f) {
+    return (f >= -9223372036854775808.0f && f < 9223372036854775808.0f) ? int64_t(f) : INT64_MIN;
+}
+
+static int64_t pair_trunc_l_d(double d) {
+    return (d >= -9223372036854775808.0 && d < 9223372036854775808.0) ? int64_t(d) : INT64_MIN;
+}
+
+// Copies a and b into the helper scratch and calls pair_slow_op.
+static void emit_slow_op(sljit_compiler* c, uint32_t slow_op, const OperandPair& a, const OperandPair& b) {
+    move_pair(c, scratch_pair(0), a);
+    move_pair(c, scratch_pair(1), b);
+    sljit_get_local_base(c, SLJIT_R0, 0, PairFrame::scratch);
+    sljit_emit_op1(c, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, slow_op);
+    sljit_emit_icall(c, SLJIT_CALL, SLJIT_ARGS2V(P, 32), SLJIT_IMM, sljit_sw(pair_slow_op));
+}
+
+// Calls pair_unaligned_op with the address in R0 and the register value in value.
+static void emit_unaligned_op(sljit_compiler* c, uint32_t mem_op, const OperandPair& value) {
+    sljit_emit_op1(c, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), PairFrame::scratch, SLJIT_R0, 0);
+    move_pair(c, scratch_pair(1), value);
+    emit_rdram_arg(c, SLJIT_R0);
+    sljit_get_local_base(c, SLJIT_R1, 0, PairFrame::scratch);
+    sljit_emit_op1(c, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, mem_op);
+    sljit_emit_icall(c, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32), SLJIT_IMM, sljit_sw(pair_unaligned_op));
+}
+
+// Masks the guest address in R0 into the rdram window.
+static void emit_mask_address(sljit_compiler* c) {
+    sljit_emit_op2(c, SLJIT_AND, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, rdram_mask);
+}
+
+enum class PairResult { Handled, NotInteger };
+
+// Integer binary ops on 32-bit hosts. Float ops and float compares fall through to the shared path. R1 stays free for an odd u32l output base.
+static PairResult emit_binary_op_pairs(sljit_compiler* c, N64Recomp::BinaryOpType type, bool is_signed, const OperandPair& d, const OperandPair& a, const OperandPair& b) {
+    using N64Recomp::BinaryOpType;
+    auto op32 = [&](sljit_s32 jit_op) {
+        sljit_emit_op2(c, jit_op, SLJIT_R2, 0, a.lo, a.low, b.lo, b.low);
+        store_s32_pair(c, d, SLJIT_R2);
+    };
+    auto op_halves = [&](sljit_s32 lo_op, sljit_s32 hi_op, bool invert) {
+        sljit_emit_op1(c, SLJIT_MOV, SLJIT_R2, 0, a.lo, a.low);
+        sljit_emit_op1(c, SLJIT_MOV, SLJIT_R1, 0, a.hi, a.hiw);
+        sljit_emit_op2(c, lo_op, SLJIT_R2, 0, SLJIT_R2, 0, b.lo, b.low);
+        sljit_emit_op2(c, hi_op, SLJIT_R1, 0, SLJIT_R1, 0, b.hi, b.hiw);
+        if (invert) {
+            sljit_emit_op2(c, SLJIT_XOR, SLJIT_R2, 0, SLJIT_R2, 0, SLJIT_IMM, -1);
+            sljit_emit_op2(c, SLJIT_XOR, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, -1);
+        }
+        sljit_emit_op1(c, SLJIT_MOV, d.lo, d.low, SLJIT_R2, 0);
+        sljit_emit_op1(c, SLJIT_MOV, d.hi, d.hiw, SLJIT_R1, 0);
+    };
+    auto slow = [&](uint32_t slow_op) {
+        emit_slow_op(c, slow_op, a, b);
+        move_pair(c, d, scratch_pair(2));
+    };
+    auto address = [&](sljit_sw address_xor) {
+        sljit_emit_op2(c, SLJIT_ADD, SLJIT_R0, 0, a.lo, a.low, b.lo, b.low);
+        if (address_xor != 0) {
+            sljit_emit_op2(c, SLJIT_XOR, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, address_xor);
+        }
+        emit_mask_address(c);
+    };
+    auto load = [&](sljit_s32 mov_op, sljit_sw address_xor, bool is_signed_load) {
+        address(address_xor);
+        sljit_emit_op1(c, mov_op, SLJIT_R0, 0, SLJIT_MEM2(Registers::rdram, SLJIT_R0), 0);
+        if (is_signed_load) {
+            store_s32_pair(c, d, SLJIT_R0);
+        }
+        else {
+            store_u32_pair(c, d, SLJIT_R0);
+        }
+    };
+    auto unaligned_load = [&](uint32_t mem_op) {
+        sljit_emit_op2(c, SLJIT_ADD, SLJIT_R0, 0, a.lo, a.low, b.lo, b.low);
+        emit_unaligned_op(c, mem_op, d);
+        move_pair(c, d, scratch_pair(2));
+    };
+
+    switch (type) {
+        case BinaryOpType::Add32: op32(SLJIT_ADD); break;
+        case BinaryOpType::Sub32: op32(SLJIT_SUB); break;
+        case BinaryOpType::Add64: op_halves(SLJIT_ADD | SLJIT_SET_CARRY, SLJIT_ADDC, false); break;
+        case BinaryOpType::Sub64: op_halves(SLJIT_SUB | SLJIT_SET_CARRY, SLJIT_SUBC, false); break;
+        case BinaryOpType::And64: op_halves(SLJIT_AND, SLJIT_AND, false); break;
+        case BinaryOpType::Or64: op_halves(SLJIT_OR, SLJIT_OR, false); break;
+        case BinaryOpType::Nor64: op_halves(SLJIT_OR, SLJIT_OR, true); break;
+        case BinaryOpType::Xor64: op_halves(SLJIT_XOR, SLJIT_XOR, false); break;
+        case BinaryOpType::Sll32: op32(SLJIT_MSHL); break;
+        case BinaryOpType::Srl32: op32(SLJIT_MLSHR); break;
+        case BinaryOpType::Sra32: slow(SlowSra32); break;
+        case BinaryOpType::Sll64: slow(SlowSll64); break;
+        case BinaryOpType::Srl64: slow(SlowSrl64); break;
+        case BinaryOpType::Sra64: slow(SlowSra64); break;
+        case BinaryOpType::Equal:
+        case BinaryOpType::NotEqual:
+        case BinaryOpType::Less:
+        case BinaryOpType::LessEq:
+        case BinaryOpType::Greater:
+        case BinaryOpType::GreaterEq:
+            emit_compare_pair(c, type, is_signed, a, b, SLJIT_R2, SLJIT_R1);
+            store_u32_pair(c, d, SLJIT_R2);
+            break;
+        case BinaryOpType::LD:
+            address(0);
+            sljit_emit_op2(c, SLJIT_ADD, SLJIT_R2, 0, SLJIT_R0, 0, SLJIT_IMM, 4);
+            sljit_emit_op1(c, SLJIT_MOV, SLJIT_R3, 0, SLJIT_MEM2(Registers::rdram, SLJIT_R0), 0);
+            sljit_emit_op1(c, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM2(Registers::rdram, SLJIT_R2), 0);
+            sljit_emit_op1(c, SLJIT_MOV, d.lo, d.low, SLJIT_R0, 0);
+            sljit_emit_op1(c, SLJIT_MOV, d.hi, d.hiw, SLJIT_R3, 0);
+            break;
+        case BinaryOpType::LW: load(SLJIT_MOV, 0, true); break;
+        case BinaryOpType::LWU: load(SLJIT_MOV, 0, false); break;
+        case BinaryOpType::LH: load(SLJIT_MOV_S16, 2, true); break;
+        case BinaryOpType::LHU: load(SLJIT_MOV_U16, 2, false); break;
+        case BinaryOpType::LB: load(SLJIT_MOV_S8, 3, true); break;
+        case BinaryOpType::LBU: load(SLJIT_MOV_U8, 3, false); break;
+        case BinaryOpType::LDL: unaligned_load(MemLDL); break;
+        case BinaryOpType::LDR: unaligned_load(MemLDR); break;
+        case BinaryOpType::LWL: unaligned_load(MemLWL); break;
+        case BinaryOpType::LWR: unaligned_load(MemLWR); break;
+        default:
+            return PairResult::NotInteger;
+    }
+    return PairResult::Handled;
 }
 
 void N64Recomp::LiveGenerator::process_binary_op(const BinaryOp& op, const InstructionContext& ctx) const {
@@ -501,6 +946,20 @@ void N64Recomp::LiveGenerator::process_binary_op(const BinaryOp& op, const Instr
 
     bool cmp_unsigned = op.operands.operand_operations[0] != UnaryOpType::ToS64;
 
+    if constexpr (gpr_pairs) {
+        OperandPair d = to_pair(op.output, dst, dstw);
+        OperandPair a = to_pair(op.operands.operands[0], src1, src1w);
+        OperandPair b = to_pair(op.operands.operands[1], src2, src2w);
+        if (ctx.reloc_type != RelocType::R_MIPS_NONE) {
+            // The relocated LO16 value is in temp1; temp4 takes its sign.
+            sljit_emit_op2(compiler, SLJIT_ASHR, Registers::arithmetic_temp4, 0, Registers::arithmetic_temp1, 0, SLJIT_IMM, 31);
+            b = { Registers::arithmetic_temp1, 0, Registers::arithmetic_temp4, 0, true };
+        }
+        if (emit_binary_op_pairs(compiler, op.type, !cmp_unsigned, d, a, b) == PairResult::Handled) {
+            return;
+        }
+    }
+
     auto sign_extend_and_store = [dst, dstw, this]() {
         // Sign extend the result.
         sljit_emit_op1(this->compiler, SLJIT_MOV_S32, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0);
@@ -521,7 +980,9 @@ void N64Recomp::LiveGenerator::process_binary_op(const BinaryOp& op, const Instr
         sljit_emit_fop2(this->compiler, op, dst, dstw, src1, src1w, src2, src2w);
     };
 
-    auto do_load_op = [dst, dstw, src1, src1w, src2, src2w, this](sljit_s32 op, int address_xor) {
+    // lwc1 writes only the low word of the fpr; the high word is the odd register in FR=0 mode.
+    sljit_s32 load_store_op = is_fpr_u32l(op.output) ? SLJIT_MOV32 : SLJIT_MOV;
+    auto do_load_op = [dst, dstw, src1, src1w, src2, src2w, load_store_op, this](sljit_s32 op, int address_xor) {
         // TODO 0 immediate optimization.
 
         // Add the base and immediate into the arithemtic temp.
@@ -536,7 +997,7 @@ void N64Recomp::LiveGenerator::process_binary_op(const BinaryOp& op, const Instr
         sljit_emit_op1(compiler, op, Registers::arithmetic_temp1, 0, SLJIT_MEM2(Registers::rdram, Registers::arithmetic_temp1), 0);
 
         // Move the arithmetic temp into the destination.
-        sljit_emit_op1(compiler, SLJIT_MOV, dst, dstw, Registers::arithmetic_temp1, 0);
+        sljit_emit_op1(compiler, load_store_op, dst, dstw, Registers::arithmetic_temp1, 0);
     };
 
     auto do_compare_op = [cmp_unsigned, dst, dstw, src1, src1w, src2, src2w, this](sljit_s32 op_unsigned, sljit_s32 op_signed) {
@@ -942,8 +1403,72 @@ void N64Recomp::LiveGenerator::process_unary_op(const UnaryOp& op, const Instruc
         sljit_emit_op1(compiler, SLJIT_MOV_S16, Registers::arithmetic_temp2, 0, Registers::arithmetic_temp1, 0);
 
         // Subtract the sign extended 16-bit value from the full address to get the HI16 value and place it in the destination.
-        sljit_emit_op2(compiler, SLJIT_SUB, dst, dstw, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp2, 0);
+        if constexpr (gpr_pairs) {
+            sljit_emit_op2(compiler, SLJIT_SUB, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp2, 0);
+            store_s32_pair(compiler, to_pair(op.output, dst, dstw), Registers::arithmetic_temp1);
+        }
+        else {
+            sljit_emit_op2(compiler, SLJIT_SUB, dst, dstw, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp2, 0);
+        }
         return;
+    }
+
+    if constexpr (gpr_pairs) {
+        // temp3 may hold an odd u32l operand's base, so the pair path avoids it.
+        OperandPair d = to_pair(op.output, dst, dstw);
+        OperandPair s = to_pair(op.input, src, srcw);
+        auto float_to_scratch = [&](bool is_double) {
+            sljit_emit_fop1(compiler, is_double ? SLJIT_MOV_F64 : SLJIT_MOV_F32, SLJIT_MEM1(SLJIT_SP), PairFrame::scratch, src, srcw);
+            sljit_get_local_base(compiler, SLJIT_R0, 0, PairFrame::scratch);
+        };
+        auto l_from_float = [&](bool is_double, void* func) {
+            float_to_scratch(is_double);
+            sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, SLJIT_IMM, sljit_sw(func));
+            sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_IMM, is_double ? sljit_sw(pair_l_from_d) : sljit_sw(pair_l_from_s));
+            move_pair(compiler, d, scratch_pair(2));
+        };
+        auto float_from_l = [&](bool is_double) {
+            move_pair(compiler, scratch_pair(0), s);
+            sljit_get_local_base(compiler, SLJIT_R0, 0, PairFrame::scratch);
+            sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS1V(P), SLJIT_IMM, is_double ? sljit_sw(pair_d_from_l) : sljit_sw(pair_s_from_l));
+            sljit_emit_fop1(compiler, is_double ? SLJIT_MOV_F64 : SLJIT_MOV_F32, dst, dstw, SLJIT_MEM1(SLJIT_SP), PairFrame::scratch + 16);
+        };
+        bool handled = true;
+        switch (op.operation) {
+            case UnaryOpType::Lui: {
+                int32_t value = (int32_t)(srcw << 16);
+                sljit_emit_op1(compiler, SLJIT_MOV, d.lo, d.low, SLJIT_IMM, value);
+                sljit_emit_op1(compiler, SLJIT_MOV, d.hi, d.hiw, SLJIT_IMM, value < 0 ? -1 : 0);
+                break;
+            }
+            case UnaryOpType::None:
+                // Pairs copy all 8 bytes, as the 64-bit JIT's word move does; u32l outputs take 32 bits.
+                move_pair(compiler, d, s);
+                break;
+            case UnaryOpType::ToS32:
+            case UnaryOpType::ToInt32:
+                sljit_emit_op1(compiler, SLJIT_MOV, Registers::arithmetic_temp1, 0, s.lo, s.low);
+                store_s32_pair(compiler, d, Registers::arithmetic_temp1);
+                break;
+            case UnaryOpType::ConvertDFromL: float_from_l(true); break;
+            case UnaryOpType::ConvertSFromL: float_from_l(false); break;
+            case UnaryOpType::ConvertLFromS: l_from_float(false, (void*)static_cast<int64_t(*)(float)>(do_cvt_l_s)); break;
+            case UnaryOpType::ConvertLFromD: l_from_float(true, (void*)static_cast<int64_t(*)(double)>(do_cvt_l_d)); break;
+            case UnaryOpType::TruncateLFromS: l_from_float(false, (void*)pair_trunc_l_s); break;
+            case UnaryOpType::TruncateLFromD: l_from_float(true, (void*)pair_trunc_l_d); break;
+            case UnaryOpType::RoundLFromS: l_from_float(false, (void*)do_round_l_s); break;
+            case UnaryOpType::RoundLFromD: l_from_float(true, (void*)do_round_l_d); break;
+            case UnaryOpType::CeilLFromS: l_from_float(false, (void*)do_ceil_l_s); break;
+            case UnaryOpType::CeilLFromD: l_from_float(true, (void*)do_ceil_l_d); break;
+            case UnaryOpType::FloorLFromS: l_from_float(false, (void*)do_floor_l_s); break;
+            case UnaryOpType::FloorLFromD: l_from_float(true, (void*)do_floor_l_d); break;
+            default:
+                handled = false;
+                break;
+        }
+        if (handled) {
+            return;
+        }
     }
 
     sljit_s32 jit_op = SLJIT_BREAKPOINT;
@@ -1195,6 +1720,36 @@ void N64Recomp::LiveGenerator::process_store_op(const StoreOp& op, const Instruc
         sljit_emit_op2(compiler, SLJIT_ADD, Registers::arithmetic_temp1, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(ctx.rs), SLJIT_IMM, imm);
     }
 
+    if constexpr (gpr_pairs) {
+        // temp2 may hold an odd u32l value's base, so the pair path avoids it.
+        OperandPair value = to_pair(op.value_input, src, srcw);
+        auto store = [&](sljit_s32 mov_op, sljit_sw address_xor) {
+            if (address_xor != 0) {
+                sljit_emit_op2(compiler, SLJIT_XOR, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0, SLJIT_IMM, address_xor);
+            }
+            emit_mask_address(compiler);
+            sljit_emit_op1(compiler, mov_op, SLJIT_MEM2(Registers::rdram, Registers::arithmetic_temp1), 0, value.lo, value.low);
+        };
+        switch (op.type) {
+            case StoreOpType::SD:
+            case StoreOpType::SDC1:
+                emit_mask_address(compiler);
+                sljit_emit_op2(compiler, SLJIT_ADD, Registers::arithmetic_temp3, 0, Registers::arithmetic_temp1, 0, SLJIT_IMM, 4);
+                sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM2(Registers::rdram, Registers::arithmetic_temp1), 0, value.hi, value.hiw);
+                sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM2(Registers::rdram, Registers::arithmetic_temp3), 0, value.lo, value.low);
+                break;
+            case StoreOpType::SW:
+            case StoreOpType::SWC1: store(SLJIT_MOV, 0); break;
+            case StoreOpType::SH: store(SLJIT_MOV_U16, 2); break;
+            case StoreOpType::SB: store(SLJIT_MOV_U8, 3); break;
+            case StoreOpType::SDL: emit_unaligned_op(compiler, MemSDL, value); break;
+            case StoreOpType::SDR: emit_unaligned_op(compiler, MemSDR, value); break;
+            case StoreOpType::SWL: emit_unaligned_op(compiler, MemSWL, value); break;
+            case StoreOpType::SWR: emit_unaligned_op(compiler, MemSWR, value); break;
+        }
+        return;
+    }
+
     auto do_unaligned_store_op = [src, srcw, this](bool left, bool doubleword) {
         // Determine the shift direction to use for calculating the mask and shifting the loaded value.
         sljit_sw shift_op = left ? SLJIT_LSHR : SLJIT_SHL;
@@ -1307,14 +1862,22 @@ void N64Recomp::LiveGenerator::emit_function_start(const std::string& function_n
     context->function_name = function_name;
     context->func_labels[func_index] = sljit_emit_label(compiler);
     // sljit_emit_op0(compiler, SLJIT_BREAKPOINT);
-    sljit_emit_enter(compiler, 0, SLJIT_ARGS2V(P, P), 4 | SLJIT_ENTER_FLOAT(1), 5 | SLJIT_ENTER_FLOAT(0), 0);
-    sljit_emit_op2(compiler, SLJIT_SUB, Registers::rdram, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+    if constexpr (gpr_pairs) {
+        sljit_emit_enter(compiler, 0, SLJIT_ARGS2V(P, P), 4 | SLJIT_ENTER_FLOAT(1), 3 | SLJIT_ENTER_FLOAT(0), PairFrame::size);
+        for (sljit_sw offset = PairFrame::hi; offset < PairFrame::lo + 8; offset += 4) {
+            sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), offset, SLJIT_IMM, 0);
+        }
+    }
+    else {
+        sljit_emit_enter(compiler, 0, SLJIT_ARGS2V(P, P), 4 | SLJIT_ENTER_FLOAT(1), 5 | SLJIT_ENTER_FLOAT(0), 0);
+        sljit_emit_op2(compiler, SLJIT_SUB, Registers::rdram, 0, Registers::rdram, 0, SLJIT_IMM, (sljit_sw)rdram_offset);
+    }
     
     // Check if this function's entry is hooked and emit the hook call if so.
     auto find_hook_it = inputs.entry_func_hooks.find(func_index);
     if (find_hook_it != inputs.entry_func_hooks.end()) {
         // Load rdram and ctx into R0 and R1.
-        sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+        emit_rdram_arg(compiler, SLJIT_R0);
         sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
         // Load the hook's index into R2.
         sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, find_hook_it->second);
@@ -1376,7 +1939,7 @@ void N64Recomp::LiveGenerator::emit_function_call_lookup(uint32_t addr) const {
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R3, 0, SLJIT_RETURN_REG, 0);
     
     // Load rdram and ctx into R0 and R1.
-    sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+    emit_rdram_arg(compiler, SLJIT_R0);
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
 
     // Call the function.
@@ -1394,7 +1957,7 @@ void N64Recomp::LiveGenerator::emit_function_call_by_register(int reg) const {
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R3, 0, SLJIT_RETURN_REG, 0);
 
     // Load rdram and ctx into R0 and R1.
-    sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+    emit_rdram_arg(compiler, SLJIT_R0);
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
 
     // Call the function.
@@ -1405,7 +1968,7 @@ void N64Recomp::LiveGenerator::emit_function_call_reference_symbol(const Context
     (void)symbol_index;
 
     // Load rdram and ctx into R0 and R1.
-    sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+    emit_rdram_arg(compiler, SLJIT_R0);
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
     // sljit_emit_op0(compiler, SLJIT_BREAKPOINT);
     // Call the function and save the jump to set its label later on.
@@ -1429,7 +1992,7 @@ void N64Recomp::LiveGenerator::emit_function_call_reference_symbol(const Context
 
 void N64Recomp::LiveGenerator::emit_function_call(const Context&, size_t function_index) const {
     // Load rdram and ctx into R0 and R1.
-    sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+    emit_rdram_arg(compiler, SLJIT_R0);
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
     // Call the function and save the jump to set its label later on.
     sljit_jump* call_jump = sljit_emit_call(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P));
@@ -1569,6 +2132,13 @@ void N64Recomp::LiveGenerator::emit_branch_condition(const ConditionalBranchOp& 
         return;
     }
 
+    if constexpr (gpr_pairs) {
+        // Skip the block when the 64-bit condition is false.
+        emit_compare_pair(compiler, op.comparison, cmp_signed, to_pair(op.operands.operands[0], src1, src1w), to_pair(op.operands.operands[1], src2, src2w), Registers::arithmetic_temp1, Registers::arithmetic_temp2);
+        context->cur_branch_jump = sljit_emit_cmp(compiler, SLJIT_EQUAL, Registers::arithmetic_temp1, 0, SLJIT_IMM, 0);
+        return;
+    }
+
     // Create a compare jump and track it as the pending branch jump.
     context->cur_branch_jump = sljit_emit_cmp(compiler, condition_type, src1, src1w, src2, src2w);
 }
@@ -1636,7 +2206,9 @@ void N64Recomp::LiveGenerator::emit_switch(const Context& recompiler_context, co
     context->switch_error_jumps.emplace_back(SwitchErrorJump{.instr_vram = jtbl.jr_vram, .jtbl_vram = jtbl.vram, .jump = switch_error_jump});
 
     // Multiply the jump table addend by 2 to get the addend for the real jump table. (4 bytes per entry to 8 bytes per entry).
-    sljit_emit_op2(compiler, SLJIT_ADD, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0);
+    if constexpr (!gpr_pairs) {
+        sljit_emit_op2(compiler, SLJIT_ADD, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0, Registers::arithmetic_temp1, 0);
+    }
     // Load the real jump table address.
     sljit_emit_op1(compiler, SLJIT_MOV, Registers::arithmetic_temp2, 0, SLJIT_IMM, (sljit_sw)cur_jump_table.get());
     // Load the real jump entry.
@@ -1671,7 +2243,7 @@ void N64Recomp::LiveGenerator::emit_return(const Context& context, size_t func_i
     auto find_hook_it = inputs.return_func_hooks.find(func_index);
     if (find_hook_it != inputs.return_func_hooks.end()) {
         // Load rdram and ctx into R0 and R1.
-        sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+        emit_rdram_arg(compiler, SLJIT_R0);
         sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
         // Load the return hook's index into R2.
         sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, find_hook_it->second);
@@ -1701,7 +2273,13 @@ void N64Recomp::LiveGenerator::emit_cop0_status_read(int reg) const {
         sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS1V(P), SLJIT_IMM, sljit_sw(inputs.cop0_status_read));
 
         // Store the result in the output register.
-        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg), SLJIT_R0, 0);
+        if constexpr (gpr_pairs) {
+            // The callback returns a sign extended 32-bit value; its low word is in R0.
+            store_s32_pair(compiler, to_pair(Operand::Rt, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg)), SLJIT_R0);
+        }
+        else {
+            sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(reg), SLJIT_R0, 0);
+        }
     }
 }
 
@@ -1713,6 +2291,14 @@ void N64Recomp::LiveGenerator::emit_cop0_status_write(int reg) const {
     // Load ctx and the input register value into R0 and R1
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R0, 0, Registers::ctx, 0);
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, src, srcw);
+
+    if constexpr (gpr_pairs) {
+        // The 64-bit gpr argument takes two stack words on 32-bit hosts, low word first.
+        OperandPair value = to_pair(Operand::Rt, src, srcw);
+        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R2, 0, value.hi, value.hiw);
+        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3V(P, 32, 32), SLJIT_IMM, sljit_sw(inputs.cop0_status_write));
+        return;
+    }
 
     // Call cop0_status_write.
     sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P,32), SLJIT_IMM, sljit_sw(inputs.cop0_status_write));
@@ -1732,7 +2318,12 @@ void N64Recomp::LiveGenerator::emit_cop1_cs_read(int reg) const {
         sljit_emit_op1(compiler, SLJIT_MOV_S32, Registers::arithmetic_temp1, 0, SLJIT_RETURN_REG, 0);
 
         // Move the sign extended result into the destination.
-        sljit_emit_op1(compiler, SLJIT_MOV, dst, dstw, Registers::arithmetic_temp1, 0);
+        if constexpr (gpr_pairs) {
+            store_s32_pair(compiler, to_pair(Operand::Rt, dst, dstw), Registers::arithmetic_temp1);
+        }
+        else {
+            sljit_emit_op1(compiler, SLJIT_MOV, dst, dstw, Registers::arithmetic_temp1, 0);
+        }
     }
 }
 
@@ -1755,7 +2346,29 @@ void N64Recomp::LiveGenerator::emit_muldiv(InstrId instr_id, int reg1, int reg2)
     sljit_sw src2w;
     get_gpr_values(reg1, src1, src1w);
     get_gpr_values(reg2, src2, src2w);
-    
+
+    if constexpr (gpr_pairs) {
+        uint32_t slow_op;
+        switch (instr_id) {
+            case InstrId::cpu_mult: slow_op = SlowMult; break;
+            case InstrId::cpu_multu: slow_op = SlowMultu; break;
+            case InstrId::cpu_dmult: slow_op = SlowDmult; break;
+            case InstrId::cpu_dmultu: slow_op = SlowDmultu; break;
+            case InstrId::cpu_div: slow_op = SlowDiv; break;
+            case InstrId::cpu_divu: slow_op = SlowDivu; break;
+            case InstrId::cpu_ddiv: slow_op = SlowDdiv; break;
+            case InstrId::cpu_ddivu: slow_op = SlowDdivu; break;
+            default:
+                assert(false && "Invalid mul/div instruction id!");
+                errored = true;
+                return;
+        }
+        emit_slow_op(compiler, slow_op, to_pair(Operand::Rs, src1, src1w), to_pair(Operand::Rs, src2, src2w));
+        move_pair(compiler, to_pair(Operand::Lo, SLJIT_MEM1(SLJIT_SP), PairFrame::lo), scratch_pair(2));
+        move_pair(compiler, to_pair(Operand::Hi, SLJIT_MEM1(SLJIT_SP), PairFrame::hi), scratch_pair(3));
+        return;
+    }
+
     auto do_mul32_op = [src1, src1w, src2, src2w, this](bool is_signed) {
         // Load the two inputs into the multiplication input registers (R0/R1).
         if (is_signed) {
@@ -1911,7 +2524,7 @@ void N64Recomp::LiveGenerator::emit_muldiv(InstrId instr_id, int reg1, int reg2)
 
 void N64Recomp::LiveGenerator::emit_syscall(uint32_t instr_vram) const {
     // Load rdram and ctx into R0 and R1.
-    sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+    emit_rdram_arg(compiler, SLJIT_R0);
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
     // Load the vram into R2.
     sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, instr_vram);
@@ -1928,14 +2541,14 @@ void N64Recomp::LiveGenerator::emit_do_break(uint32_t instr_vram) const {
 
 void N64Recomp::LiveGenerator::emit_pause_self() const {
     // Load rdram into R0.
-    sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+    emit_rdram_arg(compiler, SLJIT_R0);
     // Call pause_self.
     sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS1V(P), SLJIT_IMM, sljit_sw(inputs.pause_self));
 }
 
 void N64Recomp::LiveGenerator::emit_trigger_event(uint32_t event_index) const {
     // Load rdram and ctx into R0 and R1.
-    sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+    emit_rdram_arg(compiler, SLJIT_R0);
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
     // Load the global event index into R2.
     sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, event_index + inputs.base_event_index);
@@ -1950,7 +2563,7 @@ void N64Recomp::LiveGenerator::emit_comment(const std::string& comment) const {
 
 void N64Recomp::LiveGenerator::emit_native_hook(const NativeHook& hook) const {
     // Load rdram and ctx into R0 and R1, as the entry hook call does.
-    sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+    emit_rdram_arg(compiler, SLJIT_R0);
     sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
     if (!hook.can_return) {
         sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_IMM, sljit_sw(hook.func));

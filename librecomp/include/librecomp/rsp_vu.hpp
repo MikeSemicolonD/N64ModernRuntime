@@ -20,11 +20,11 @@
 // ----------------------------------------------------------------------
 #include <cstdint>
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #define ARCHITECTURE_SUPPORTS_SSE4_1 1
 #include <nmmintrin.h>
 using v128 = __m128i;
-#elif defined(__aarch64__) || defined(_M_ARM64)
+#elif defined(__aarch64__) || defined(_M_ARM64) || (defined(__arm__) && defined(__ARM_NEON))
 #define ARCHITECTURE_SUPPORTS_SSE4_1 1
 #include <sse2neon.h>
 using v128 = __m128i;

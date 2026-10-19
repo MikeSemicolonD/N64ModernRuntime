@@ -52,7 +52,7 @@ static inline void DMULTU(uint64_t a, uint64_t b, uint64_t* lo64, uint64_t* hi64
     *lo64 = (uint64_t)(full128 >> 0);
 }
 
-#elif defined(_MSC_VER)
+#elif defined(_MSC_VER) && defined(_M_X64)
 
 #include <intrin.h>
 #pragma intrinsic(_mul128)
@@ -67,7 +67,25 @@ static inline void DMULTU(uint64_t a, uint64_t b, uint64_t* lo64, uint64_t* hi64
 }
 
 #else
-#error "128-bit integer type not found"
+
+// 32-bit targets have neither __int128 nor _mul128.
+static inline void DMULTU(uint64_t a, uint64_t b, uint64_t* lo64, uint64_t* hi64) {
+    uint64_t a_lo = (uint32_t)a, a_hi = a >> 32, b_lo = (uint32_t)b, b_hi = b >> 32;
+    uint64_t ll = a_lo * b_lo, lh = a_lo * b_hi, hl = a_hi * b_lo, hh = a_hi * b_hi;
+    uint64_t mid = (ll >> 32) + (uint32_t)lh + (uint32_t)hl;
+    *lo64 = (mid << 32) | (uint32_t)ll;
+    *hi64 = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+}
+
+static inline void DMULT(int64_t a, int64_t b, int64_t* lo64, int64_t* hi64) {
+    uint64_t lo, hi;
+    DMULTU((uint64_t)a, (uint64_t)b, &lo, &hi);
+    if (a < 0) hi -= (uint64_t)b;
+    if (b < 0) hi -= (uint64_t)a;
+    *lo64 = (int64_t)lo;
+    *hi64 = (int64_t)hi;
+}
+
 #endif
 
 static inline void DDIV(int64_t a, int64_t b, int64_t* quot, int64_t* rem) {
@@ -92,24 +110,31 @@ typedef uint64_t gpr;
 #define SUB32(a, b) \
     ((gpr)(int32_t)((a) - (b)))
 
+// 64-bit hosts reserve 4GB after rdram so any guest address faults instead of hitting host memory; 32-bit hosts can't, so they wrap into the 512MB window.
+#if UINTPTR_MAX == 0xFFFFFFFFu
+#define RDRAM_OFFSET(addr) (((uint32_t)(addr) - 0x80000000u) & 0x1FFFFFFFu)
+#else
+#define RDRAM_OFFSET(addr) ((addr) - 0xFFFFFFFF80000000)
+#endif
+
 #define MEM_W(offset, reg) \
-    (*(int32_t*)(rdram + ((((reg) + (offset))) - 0xFFFFFFFF80000000)))
+    (*(int32_t*)(rdram + RDRAM_OFFSET(((reg) + (offset)))))
 
 #define MEM_H(offset, reg) \
-    (*(int16_t*)(rdram + ((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000)))
+    (*(int16_t*)(rdram + RDRAM_OFFSET(((reg) + (offset)) ^ 2)))
 
 #define MEM_B(offset, reg) \
-    (*(int8_t*)(rdram + ((((reg) + (offset)) ^ 3) - 0xFFFFFFFF80000000)))
+    (*(int8_t*)(rdram + RDRAM_OFFSET(((reg) + (offset)) ^ 3)))
 
 #define MEM_HU(offset, reg) \
-    (*(uint16_t*)(rdram + ((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000)))
+    (*(uint16_t*)(rdram + RDRAM_OFFSET(((reg) + (offset)) ^ 2)))
 
 #define MEM_BU(offset, reg) \
-    (*(uint8_t*)(rdram + ((((reg) + (offset)) ^ 3) - 0xFFFFFFFF80000000)))
+    (*(uint8_t*)(rdram + RDRAM_OFFSET(((reg) + (offset)) ^ 3)))
 
 #define SD(val, offset, reg) { \
-    *(uint32_t*)(rdram + ((((reg) + (offset) + 4)) - 0xFFFFFFFF80000000)) = (uint32_t)((gpr)(val) >> 0); \
-    *(uint32_t*)(rdram + ((((reg) + (offset) + 0)) - 0xFFFFFFFF80000000)) = (uint32_t)((gpr)(val) >> 32); \
+    *(uint32_t*)(rdram + RDRAM_OFFSET(((reg) + (offset) + 4))) = (uint32_t)((gpr)(val) >> 0); \
+    *(uint32_t*)(rdram + RDRAM_OFFSET(((reg) + (offset) + 0))) = (uint32_t)((gpr)(val) >> 32); \
 }
 
 static inline uint64_t load_doubleword(uint8_t* rdram, gpr reg, gpr offset) {
@@ -361,33 +386,35 @@ static inline void set_cop1_cs(uint32_t val) {
 
 #define DEFAULT_ROUNDING_MODE 0
 
+// Rounding mode aware conversion; NaN and out-of-range give INT32_MIN like x86's cvtss2si on every host (lrint's long is 32 or 64 bits).
+static inline int32_t do_cvt_w_d(double val);
 static inline int32_t do_cvt_w_s(float val) {
-    // Rounding mode aware float to 32-bit int conversion.
-    return (int32_t)lrintf(val);
+    return do_cvt_w_d((double)val);
 }
 
 #define CVT_W_S(val) \
     do_cvt_w_s(val)
 
+static inline int64_t do_cvt_l_d(double val);
 static inline int64_t do_cvt_l_s(float val) {
-    // Rounding mode aware float to 64-bit int conversion.
-    return (int64_t)llrintf(val);
+    return do_cvt_l_d((double)val);
 }
 
 #define CVT_L_S(val) \
     do_cvt_l_s(val);
 
 static inline int32_t do_cvt_w_d(double val) {
-    // Rounding mode aware double to 32-bit int conversion.
-    return (int32_t)lrint(val);
+    double rounded = rint(val);
+    return (rounded >= -2147483648.0 && rounded <= 2147483647.0) ? (int32_t)rounded : INT32_MIN;
 }
 
 #define CVT_W_D(val) \
     do_cvt_w_d(val)
 
+// Same contract as do_cvt_w_d: NaN and out-of-range give INT64_MIN on every host.
 static inline int64_t do_cvt_l_d(double val) {
-    // Rounding mode aware double to 64-bit int conversion.
-    return (int64_t)llrint(val);
+    double rounded = rint(val);
+    return (rounded >= -9223372036854775808.0 && rounded < 9223372036854775808.0) ? (int64_t)rounded : INT64_MIN;
 }
 
 #define CVT_L_D(val) \
