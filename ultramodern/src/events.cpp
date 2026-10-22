@@ -938,6 +938,13 @@ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle wind
         };
 
         const std::string driver_os_suffix = "\nPlease make sure your GPU drivers and your OS are up to date.";
+#if defined(__ANDROID__)
+        // Vulkan is the only renderer on Android, so a missing API or device means the phone has no usable Vulkan 1.1 driver.
+        if (setup_result == ultramodern::renderer::SetupResult::GraphicsAPINotFound || setup_result == ultramodern::renderer::SetupResult::GraphicsDeviceNotFound) {
+            show_renderer_error("This device has no Vulkan 1.1 graphics driver, which the game needs to run.");
+            throw std::runtime_error("Failed to initialize the renderer");
+        }
+#endif
         switch (setup_result) {
             case ultramodern::renderer::SetupResult::Success:
                 break;
