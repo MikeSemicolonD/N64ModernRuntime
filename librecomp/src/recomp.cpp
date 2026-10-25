@@ -204,6 +204,10 @@ bool recomp::is_rom_valid(std::u8string& game_id) {
 
 void recomp::check_all_stored_roms() {
     for (const auto& cur_rom_entry: game_roms) {
+        // Already hashed this run; select_rom only stores a ROM that passed the hash, so it can't have gone bad since.
+        if (valid_game_roms.contains(cur_rom_entry.first)) {
+            continue;
+        }
         if (check_stored_rom(cur_rom_entry.second)) {
             valid_game_roms.insert(cur_rom_entry.first);
         }
