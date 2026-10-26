@@ -8,6 +8,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <vector>
+#include <algorithm>
 #include <deque>
 #include <cstring>
 #include <cstdlib>
@@ -82,18 +84,37 @@ static bool parse_snapshot_enabled() {
 }
 // ROGUESQ_LOG_FRAME_PROFILE: last snapshot memcpy duration (us), sampled by the hitch report.
 extern "C" volatile long long g_rs64_snap_us; volatile long long g_rs64_snap_us = 0;
+
+// Host RAM ranges below 16 MB the parse also reads, as RDRAM offsets (language mods move texture pools there).
+static std::mutex g_snap_ranges_mutex;
+static std::vector<std::pair<uint32_t, uint32_t>> g_snap_ranges;
+
+extern "C" void rs64_snapshot_add_range(uint32_t lo, uint32_t hi) {
+    std::lock_guard lock(g_snap_ranges_mutex);
+    for (auto& r : g_snap_ranges) {
+        if (r.first == lo) { r.second = std::max(r.second, hi); return; }
+    }
+    g_snap_ranges.emplace_back(lo, hi);
+}
+
 static uint8_t* take_rdram_snapshot(const uint8_t* rdram) {
     const auto snap0 = std::chrono::high_resolution_clock::now();
     // RT64's F5 GBI writes scratch (vertices @0xA00000, viewport @0xA01000) ABOVE the 8 MB game RAM, and
     // reads/writes it through state->RDRAM (= this buffer during the parse). An 8 MB buffer sends those
     // writes ~2 MB out of bounds -> heap corruption / AVs in f5_set_viewport (the in-mission instability).
-    // Size the buffer past the scratch region. RogueSquadron64Recomp (2026-09-09).
-    static constexpr size_t kSnapSize = 0xC00000;   // 12 MB: 8 MB game RAM + F5 scratch at 0xA0xxxx
+    // Size the buffer to the whole 24-bit RDP address space (16 MB): the F5 scratch and any registered host range fit.
+    static constexpr size_t kSnapSize = 0x1000000;
     static uint8_t* bufs[3] = { nullptr, nullptr, nullptr };
     static unsigned next = 0;
     uint8_t*& b = bufs[next++ % 3];
     if (!b) { b = static_cast<uint8_t*>(std::malloc(kSnapSize)); if (b) std::memset(b, 0, kSnapSize); }
-    if (b) std::memcpy(b, rdram, 0x800000);
+    if (b) {
+        std::memcpy(b, rdram, 0x800000);
+        std::lock_guard lock(g_snap_ranges_mutex);
+        for (const auto& r : g_snap_ranges) {
+            if (r.first < r.second && r.second <= kSnapSize) std::memcpy(b + r.first, rdram + r.first, r.second - r.first);
+        }
+    }
     g_rs64_snap_us = (long long)std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::high_resolution_clock::now() - snap0).count();
     return b;
