@@ -629,6 +629,8 @@ namespace recomp {
         void initialize_mods();
         void register_embedded_mod(const std::string &mod_id, std::span<const uint8_t> mod_bytes);
         void scan_mods();
+        // The mods the last scan could not open (each also printed then), for a game's own mod list.
+        std::vector<ModOpenErrorDetails> get_mod_open_errors();
         void close_mods();
         std::filesystem::path get_mods_directory();
         std::optional<ModDetails> get_details_for_mod(const std::string& mod_id);

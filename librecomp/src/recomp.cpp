@@ -97,11 +97,19 @@ void recomp::mods::register_embedded_mod(const std::string &mod_id, std::span<co
     mod_context->register_embedded_mod(mod_id, mod_bytes);
 }
 
+static std::vector<recomp::mods::ModOpenErrorDetails> last_mod_open_errors;
+
+std::vector<recomp::mods::ModOpenErrorDetails> recomp::mods::get_mod_open_errors() {
+    std::lock_guard mod_lock{ mod_context_mutex };
+    return last_mod_open_errors;
+}
+
 void recomp::mods::scan_mods() {
     std::vector<recomp::mods::ModOpenErrorDetails> mod_open_errors;
     {
         std::lock_guard mod_lock{ mod_context_mutex };
         mod_open_errors = mod_context->scan_mod_folder(config_path / mods_directory);
+        last_mod_open_errors = mod_open_errors;
     }
     for (const auto& cur_error : mod_open_errors) {
         printf("Error opening mod " PATHFMT ": %s (%s)\n", cur_error.mod_path.c_str(), recomp::mods::error_to_string(cur_error.error).c_str(), cur_error.error_param.c_str());
