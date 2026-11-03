@@ -29,8 +29,6 @@ static bool vi_wait_parse_enabled() {
     static const bool on = [](){ const char* e = std::getenv("ROGUESQ_VI_WAIT_PARSE"); if (e && e[0]) return e[0] != '0'; return !parse_snapshot_enabled(); }();
     return on;
 }
-static bool gfx_sync_submit_enabled();
-extern moodycamel::LightweightSemaphore g_gfx_task_parsed;
 // Called from the game's chunk-release functions (hand edits in funcs_3.c): a release while RT64 is still
 // reading the list rewrites chunk headers under the parser. Hardware never gets here (the RSP is done in
 // a few ms); wait for the in-flight parse instead. Bounded. ROGUESQ_VI_WAIT_PARSE=0 disables.
@@ -621,7 +619,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 // RogueSquadron64Recomp (2026-09-07): ROGUESQ_SP_COMPLETE_AFTER_PARSE=1 delivers the SP-done
                 // event only after the list has been parsed, as the RSP would. With the early completion the
                 // game recycles DL chunks the HLE is still walking (phantom commands / garbage SETCIMG).
-                static const bool s_sp_after = [](){ const char* e = std::getenv("ROGUESQ_SP_COMPLETE_AFTER_PARSE"); const char* v = std::getenv("ROGUESQ_VI_DRIVEN_LOOP"); if (e && *e) return *e != '0'; return !(v && *v && *v == '0'); }();   // default on with the VI-driven loop
+                static const bool s_sp_after = [](){ const char* e = std::getenv("ROGUESQ_SP_COMPLETE_AFTER_PARSE"); return !(e && *e == '0'); }();   // default on
                 if (!s_sp_after) sp_complete();
                 ultramodern::measure_input_latency();
 
@@ -674,7 +672,6 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 { std::lock_guard<std::mutex> plock{ g_gfx_parse_mutex }; if (g_gfx_parse_inflight.load(std::memory_order_acquire) > 0) g_gfx_parse_inflight.fetch_sub(1, std::memory_order_acq_rel); }
                 g_gfx_parse_cv.notify_all();
                 if (s_log_task) { fprintf(stderr, "[gfx-task #%u] done sp+dp signaled parse=%lld us pdl=%lld us hops=%u faces=%u req=%u inflight=%d\n", s_task_n, (long long)std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count(), g_rs64_pdl_us, g_f5_task_hops, g_f5_task_faces, g_rs64_gfx_requests, g_gfx_parse_inflight.load(std::memory_order_acquire)); fflush(stderr); }
-                if (gfx_sync_submit_enabled()) g_gfx_task_parsed.signal();   // ROGUESQ_GFX_SYNC_SUBMIT
                 // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
                 ultramodern::extensions::on_displaylist_parsed(displaylist);
                 ultramodern::extensions::on_displaylist_completed(displaylist);
@@ -890,13 +887,6 @@ extern "C" PTR(void) osViGetCurrentFramebuffer() {
     return events_context.vi.get_cur_state()->framebuffer;
 }
 
-static bool gfx_sync_submit_enabled() {
-    static int s = -1;
-    if (s < 0) { const char* e = std::getenv("ROGUESQ_GFX_SYNC_SUBMIT"); s = (e && *e && *e != '0') ? 1 : 0; }
-    return s == 1;
-}
-moodycamel::LightweightSemaphore g_gfx_task_parsed;
-
 void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     OSTask* task = TO_PTR(OSTask, task_);
 
@@ -906,11 +896,6 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
     // to sp_task_queue → task_thread_func → rsp::run_task (LLE).
     if (task->t.type == M_GFXTASK) {
         events_context.action_queue.enqueue(SpTaskAction{ *task, parse_snapshot_enabled() ? take_rdram_snapshot(rdram) : nullptr });
-        // RogueSquadron64Recomp (2026-09-07): ROGUESQ_GFX_SYNC_SUBMIT=1 waits until the gfx thread has
-        // parsed this list (send_dl + dp_complete). On hardware the RSP consumes the list before the game
-        // can recycle its DL chunks; otherwise the game thread runs ahead and reuses chunks the HLE is
-        // still walking (phantom commands, garbage SETCIMG, fb-registry crash). Experiment.
-        if (gfx_sync_submit_enabled()) g_gfx_task_parsed.wait();
     }
     else {
         // Track in-flight async audio synth tasks so osAiSetNextBuffer can wait
