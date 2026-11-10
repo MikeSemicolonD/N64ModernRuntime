@@ -114,6 +114,8 @@ bool is_game_thread();
 void submit_rsp_task(RDRAM_ARG PTR(OSTask) task);
 void send_si_message();
 uint32_t get_speed_multiplier();
+void set_vi_rate(uint32_t hz);
+uint32_t get_vi_rate();
 
 // Time
 std::chrono::high_resolution_clock::time_point get_start();

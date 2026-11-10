@@ -335,6 +335,16 @@ void ai_thread_func() {
     }
 }
 
+static std::atomic<uint32_t> g_vi_rate{ 60 };
+
+void ultramodern::set_vi_rate(uint32_t hz) {
+    g_vi_rate.store(hz, std::memory_order_relaxed);
+}
+
+uint32_t ultramodern::get_vi_rate() {
+    return g_vi_rate.load(std::memory_order_relaxed);
+}
+
 void vi_thread_func() {
     ultramodern::set_native_thread_name("VI Thread");
     // This thread should be prioritized over every other thread in the application, as it's what allows
@@ -346,7 +356,8 @@ void vi_thread_func() {
 
     while (!exited) {
         // Determine the next VI time (more accurate than adding 16ms each VI interrupt)
-        auto next = ultramodern::get_start() + (total_vis * 1000000us) / (60 * ultramodern::get_speed_multiplier());
+        const uint32_t vi_rate = ultramodern::get_speed_multiplier() * ultramodern::get_vi_rate();
+        auto next = ultramodern::get_start() + (total_vis * 1000000us) / vi_rate;
         //if (next > std::chrono::high_resolution_clock::now()) {
         //    printf("Sleeping for %" PRIu64 " us to get from %" PRIu64 " us to %" PRIu64 " us \n",
         //        (next - std::chrono::high_resolution_clock::now()) / 1us,
@@ -363,7 +374,7 @@ void vi_thread_func() {
         ultramodern::sleep_until(next);
         auto time_now = ultramodern::time_since_start();
         // Calculate how many VIs have passed
-        uint64_t new_total_vis = (time_now * (60 * ultramodern::get_speed_multiplier()) / 1000ms) + 1;
+        uint64_t new_total_vis = (time_now * vi_rate / 1000ms) + 1;
         if (new_total_vis > total_vis + 1) {
             //printf("Skipped % " PRId64 " frames in VI interupt thread!\n", new_total_vis - total_vis - 1);
         }
