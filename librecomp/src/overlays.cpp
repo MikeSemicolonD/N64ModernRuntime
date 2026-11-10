@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -442,9 +443,17 @@ recomp_func_t* recomp::overlays::get_func_by_section_rom_function_vram(uint32_t 
     return get_func_by_section_index_function_offset(find_section_it->second, func_offset);
 }
 
+// Calls to an address with no function, stubbed below; the host prints the total at the end of a replay.
+static std::atomic<unsigned> s_null_calls{0};
+
+extern "C" unsigned recomp_null_call_count(void) {
+    return s_null_calls.load(std::memory_order_relaxed);
+}
+
 extern "C" recomp_func_t * get_function(int32_t addr) {
     auto func_find = func_map.find(addr);
     if (func_find == func_map.end()) {
+        s_null_calls.fetch_add(1, std::memory_order_relaxed);
 #ifdef _MSC_VER
         void *ra = _ReturnAddress();
         // JAL/JALR sites don't write ctx->r31 (only bgezal/bltzal-style links do, via emit_link_address), so a tail-return through a register copied from $ra can reach LOOKUP_FUNC(0).

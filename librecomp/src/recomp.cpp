@@ -11,6 +11,7 @@
 #include <optional>
 #include <mutex>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cuchar>
 #include <charconv>
@@ -489,6 +490,13 @@ static void invoke_recomp_func(recomp_func_t* func, uint8_t* rdram, recomp_conte
     }
 }
 
+// Guest faults caught below, each ending its thread; the host prints the total at the end of a replay.
+static std::atomic<unsigned> s_faults_caught{0};
+
+extern "C" unsigned recomp_fault_caught_count(void) {
+    return s_faults_caught.load(std::memory_order_relaxed);
+}
+
 void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t arg) {
     auto find_it = game_roms.find(current_game.value());
     const recomp::GameEntry& game_entry = find_it->second;
@@ -532,6 +540,7 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
                 av_frame_count = RtlCaptureStackBackTrace(0, 8, av_frames, NULL),
                 EXCEPTION_EXECUTE_HANDLER )
     ) {
+        s_faults_caught.fetch_add(1, std::memory_order_relaxed);
         const char* kind_str = (av_kind == 0) ? "READ" : (av_kind == 1) ? "WRITE" : (av_kind == 8) ? "EXEC" : "?";
         // Module base, so the av_pc / frames can be resolved to RVAs despite
         // ASLR (tools/resolve-rva.ps1 expects RVAs, not absolute addresses).
@@ -555,6 +564,7 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
         invoke_recomp_func(c->func, c->rdram, c->ctx);
     }, &call, &fault);
     if (!completed) {
+        s_faults_caught.fetch_add(1, std::memory_order_relaxed);
         // pc_off is the offset into the faulting library, for addr2line on its unstripped build.
         Dl_info dl{};
         const bool have_dl = fault.pc != 0 && dladdr((void*)fault.pc, &dl) != 0;
