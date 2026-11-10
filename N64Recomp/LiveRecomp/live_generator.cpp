@@ -59,6 +59,13 @@ static void emit_rdram_arg(sljit_compiler* compiler, sljit_s32 reg) {
     }
 }
 
+// Keeps only a guest address's low 32 bits (RDRAM_OFFSET in recomp.h), so a non-canonical register value stays inside the reservation after rdram.
+static void emit_wrap_address(sljit_compiler* compiler, sljit_s32 reg) {
+    if constexpr (!gpr_pairs) {
+        sljit_emit_op1(compiler, SLJIT_MOV_S32, reg, 0, reg, 0);
+    }
+}
+
 struct InnerCall {
     size_t target_func_index;
     sljit_jump* jump;
@@ -987,6 +994,7 @@ void N64Recomp::LiveGenerator::process_binary_op(const BinaryOp& op, const Instr
 
         // Add the base and immediate into the arithemtic temp.
         sljit_emit_op2(compiler, SLJIT_ADD, Registers::arithmetic_temp1, 0, src1, src1w, src2, src2w);
+        emit_wrap_address(compiler, Registers::arithmetic_temp1);
 
         if (address_xor != 0) {
             // xor the address with the specified amount
@@ -1043,6 +1051,7 @@ void N64Recomp::LiveGenerator::process_binary_op(const BinaryOp& op, const Instr
         // Add the base and immediate into the temp1.
         // addr = base + offset
         sljit_emit_op2(compiler, SLJIT_ADD, Registers::arithmetic_temp1, 0, src1, src1w, src2, src2w);
+        emit_wrap_address(compiler, Registers::arithmetic_temp1);
 
         // Mask the address with the alignment mask to get the misalignment and put it in temp2.
         // misalignment = addr & (word_size - 1);
@@ -1244,7 +1253,8 @@ void N64Recomp::LiveGenerator::process_binary_op(const BinaryOp& op, const Instr
         case BinaryOpType::LD:
             // Add the base and immediate into the arithemtic temp.
             sljit_emit_op2(compiler, SLJIT_ADD, Registers::arithmetic_temp1, 0, src1, src1w, src2, src2w);
-        
+            emit_wrap_address(compiler, Registers::arithmetic_temp1);
+
             // Load the value at rdram + address into the arithemtic temp and rotate it by 32 bits to swap the two words into the right order.
             sljit_emit_op2(compiler, SLJIT_ROTL, Registers::arithmetic_temp1, 0, SLJIT_MEM2(Registers::rdram, Registers::arithmetic_temp1), 0, SLJIT_IMM, 32);
 
@@ -1719,6 +1729,8 @@ void N64Recomp::LiveGenerator::process_store_op(const StoreOp& op, const Instruc
         // Add the base register (rs) and the immediate to get the address and store it in the arithemtic temp.
         sljit_emit_op2(compiler, SLJIT_ADD, Registers::arithmetic_temp1, 0, SLJIT_MEM1(Registers::ctx), get_gpr_context_offset(ctx.rs), SLJIT_IMM, imm);
     }
+
+    emit_wrap_address(compiler, Registers::arithmetic_temp1);
 
     if constexpr (gpr_pairs) {
         // temp2 may hold an odd u32l value's base, so the pair path avoids it.

@@ -110,11 +110,11 @@ typedef uint64_t gpr;
 #define SUB32(a, b) \
     ((gpr)(int32_t)((a) - (b)))
 
-// 64-bit hosts reserve 4GB after rdram so any guest address faults instead of hitting host memory; 32-bit hosts can't, so they wrap into the 512MB window.
+// 64-bit hosts reserve 4GB after rdram and keep only an address's low 32 bits, so any guest address, even a non-canonical register value, faults instead of hitting host memory; 32-bit hosts can't, so they wrap into the 512MB window.
 #if UINTPTR_MAX == 0xFFFFFFFFu
 #define RDRAM_OFFSET(addr) (((uint32_t)(addr) - 0x80000000u) & 0x1FFFFFFFu)
 #else
-#define RDRAM_OFFSET(addr) ((addr) - 0xFFFFFFFF80000000)
+#define RDRAM_OFFSET(addr) ((uint32_t)(addr) - 0x80000000u)
 #endif
 
 #define MEM_W(offset, reg) \
