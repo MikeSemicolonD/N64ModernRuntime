@@ -95,6 +95,9 @@ extern "C" void rs64_snapshot_add_range(uint32_t lo, uint32_t hi) {
     g_snap_ranges.emplace_back(lo, hi);
 }
 
+void* rs64_alloc_write_watched(size_t size);
+bool rs64_written_pages(const void* base, size_t size, std::vector<uint32_t>& offsets);
+
 static uint8_t* take_rdram_snapshot(const uint8_t* rdram) {
     const auto snap0 = std::chrono::high_resolution_clock::now();
     // RT64's F5 GBI writes scratch (vertices @0xA00000, viewport @0xA01000) ABOVE the 8 MB game RAM, and
@@ -102,15 +105,48 @@ static uint8_t* take_rdram_snapshot(const uint8_t* rdram) {
     // writes ~2 MB out of bounds -> heap corruption / AVs in f5_set_viewport (the in-mission instability).
     // Size the buffer to the whole 24-bit RDP address space (16 MB): the F5 scratch and any registered host range fit.
     static constexpr size_t kSnapSize = 0x1000000;
+    static constexpr uint32_t kPage = 0x1000;
+    static constexpr uint32_t kGameRam = 0x800000;
     static uint8_t* bufs[3] = { nullptr, nullptr, nullptr };
+    static std::vector<uint8_t> stale[3];
+    static std::vector<uint32_t> written;
     static unsigned next = 0;
-    uint8_t*& b = bufs[next++ % 3];
-    if (!b) { b = static_cast<uint8_t*>(std::malloc(kSnapSize)); if (b) std::memset(b, 0, kSnapSize); }
+    const unsigned slot = next++ % 3;
+    uint8_t*& b = bufs[slot];
+    if (!b) {
+        b = static_cast<uint8_t*>(rs64_alloc_write_watched(kSnapSize));
+        stale[slot].assign(kSnapSize / kPage, 1);
+    }
     if (b) {
-        std::memcpy(b, rdram, 0x800000);
+        // Each buffer recopies only the pages the game wrote since that buffer's last copy, and the pages the parse wrote into it.
+        bool delta = rs64_written_pages(rdram, kSnapSize, written);
+        for (uint32_t off : written) {
+            for (auto& s : stale) if (!s.empty()) s[off / kPage] = 1;
+        }
+        delta = delta && rs64_written_pages(b, kSnapSize, written);
+        for (uint32_t off : written) stale[slot][off / kPage] = 1;
+
         std::lock_guard lock(g_snap_ranges_mutex);
-        for (const auto& r : g_snap_ranges) {
-            if (r.first < r.second && r.second <= kSnapSize) std::memcpy(b + r.first, rdram + r.first, r.second - r.first);
+        const auto copy = [&](uint32_t lo, uint32_t hi) {
+            if (lo < hi) std::memcpy(b + lo, rdram + lo, hi - lo);
+        };
+        if (!delta) {
+            copy(0, kGameRam);
+            for (const auto& r : g_snap_ranges) if (r.second <= kSnapSize) copy(r.first, r.second);
+        }
+        else {
+            for (uint32_t p = 0; p < kSnapSize / kPage; p++) {
+                if (!stale[slot][p]) continue;
+                stale[slot][p] = 0;
+                const uint32_t lo = p * kPage;
+                const uint32_t hi = lo + kPage;
+                if (hi <= kGameRam) {
+                    copy(lo, hi);
+                    continue;
+                }
+                for (const auto& r : g_snap_ranges) if (r.second <= kSnapSize) copy(std::max(lo, r.first), std::min(hi, r.second));
+            }
+            rs64_written_pages(b, kSnapSize, written);
         }
     }
     g_rs64_snap_us = (long long)std::chrono::duration_cast<std::chrono::microseconds>(

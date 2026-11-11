@@ -2,6 +2,7 @@
 #include <thread>
 #include <variant>
 #include <set>
+#include <vector>
 #include "blockingconcurrentqueue.h"
 
 #include "ultramodern/ultra64.h"
@@ -244,7 +245,38 @@ void ultramodern::sleep_until(const std::chrono::high_resolution_clock::time_poi
     Sleep(delta_ms);
 }
 
+void* rs64_alloc_write_watched(size_t size) {
+    return VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+}
+
+// Byte offsets of the 4 KB pages in [base, base + size) written since the last call, resetting the watch; false when the range isn't write-watched.
+bool rs64_written_pages(const void* base, size_t size, std::vector<uint32_t>& offsets) {
+    thread_local std::vector<PVOID> addrs;
+    addrs.resize(size / 0x1000 + 1);
+    ULONG_PTR count = addrs.size();
+    ULONG granularity = 0;
+    offsets.clear();
+    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, const_cast<void*>(base), size, addrs.data(), &count, &granularity) != 0 || granularity != 0x1000) {
+        return false;
+    }
+
+    for (ULONG_PTR i = 0; i < count; i++) {
+        offsets.push_back(uint32_t(static_cast<uint8_t*>(addrs[i]) - static_cast<const uint8_t*>(base)));
+    }
+
+    return true;
+}
+
 #else
+
+void* rs64_alloc_write_watched(size_t size) {
+    return std::calloc(1, size);
+}
+
+bool rs64_written_pages(const void*, size_t, std::vector<uint32_t>& offsets) {
+    offsets.clear();
+    return false;
+}
 
 void ultramodern::sleep_milliseconds(uint32_t millis) {
     std::this_thread::sleep_for(std::chrono::milliseconds{millis});

@@ -895,7 +895,8 @@ void recomp::start(const recomp::Configuration& cfg) {
     uint8_t* rdram;
     bool alloc_failed;
 #ifdef _WIN32
-    rdram = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocation_size, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS));
+    // MEM_WRITE_WATCH lets the graphics-task snapshot copy only the pages written since its last copy.
+    rdram = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocation_size, MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS));
     DWORD old_protect = 0;
     alloc_failed = (rdram == nullptr);
     if (!alloc_failed) {
