@@ -118,15 +118,32 @@ static uint8_t* take_rdram_snapshot(const uint8_t* rdram) {
         stale[slot].assign(kSnapSize / kPage, 1);
     }
     if (b) {
+        std::lock_guard lock(g_snap_ranges_mutex);
+
         // Each buffer recopies only the pages the game wrote since that buffer's last copy, and the pages the parse wrote into it.
-        bool delta = rs64_written_pages(rdram, kSnapSize, written);
+        // Only the copied spans are watched (the game RAM and the registered ranges): the query walks every page it is given.
+        static std::vector<uint32_t> spanPages;
+        const auto watch = [&](const uint8_t* base, bool& ok) {
+            written.clear();
+            const auto span = [&](uint32_t lo, uint32_t hi) {
+                lo &= ~(kPage - 1);
+                hi = (hi + kPage - 1) & ~(kPage - 1);
+                if (ok && (lo < hi) && (hi <= kSnapSize)) {
+                    ok = rs64_written_pages(base + lo, hi - lo, spanPages);
+                    for (uint32_t off : spanPages) written.push_back(lo + off);
+                }
+            };
+            span(0, kGameRam);
+            for (const auto& r : g_snap_ranges) span(r.first, r.second);
+        };
+        bool delta = true;
+        watch(rdram, delta);
         for (uint32_t off : written) {
             for (auto& s : stale) if (!s.empty()) s[off / kPage] = 1;
         }
-        delta = delta && rs64_written_pages(b, kSnapSize, written);
+        watch(b, delta);
         for (uint32_t off : written) stale[slot][off / kPage] = 1;
 
-        std::lock_guard lock(g_snap_ranges_mutex);
         const auto copy = [&](uint32_t lo, uint32_t hi) {
             if (lo < hi) std::memcpy(b + lo, rdram + lo, hi - lo);
         };
@@ -146,7 +163,8 @@ static uint8_t* take_rdram_snapshot(const uint8_t* rdram) {
                 }
                 for (const auto& r : g_snap_ranges) if (r.second <= kSnapSize) copy(std::max(lo, r.first), std::min(hi, r.second));
             }
-            rs64_written_pages(b, kSnapSize, written);
+            bool reset = true;
+            watch(b, reset);
         }
     }
     g_rs64_snap_us = (long long)std::chrono::duration_cast<std::chrono::microseconds>(
