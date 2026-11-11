@@ -223,12 +223,25 @@ void ultramodern::sleep_milliseconds(uint32_t millis) {
 }
 
 void ultramodern::sleep_until(const std::chrono::high_resolution_clock::time_point& time_point) {
+    // Sleep rounds up to whole milliseconds: a 240 Hz VI tick waited 5-6 ms, and the game counts ticks, so 4-tick frames ran near 45 fps instead of 60.
+    thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     auto time_now = std::chrono::high_resolution_clock::now();
-    if (time_point > time_now) {
-        long long delta_ms = std::chrono::ceil<std::chrono::milliseconds>(time_point - time_now).count();
-        // printf("Sleeping %lld %d ms\n", delta_ms, (uint32_t)delta_ms);
-        Sleep(delta_ms);
+    if (time_point <= time_now) {
+        return;
     }
+
+    if (timer != nullptr) {
+        LARGE_INTEGER due;
+        const long long ticks = std::chrono::duration_cast<std::chrono::nanoseconds>(time_point - time_now).count() / 100;
+        due.QuadPart = -(ticks > 0 ? ticks : 1);
+        if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
+            WaitForSingleObject(timer, INFINITE);
+            return;
+        }
+    }
+
+    long long delta_ms = std::chrono::ceil<std::chrono::milliseconds>(time_point - time_now).count();
+    Sleep(delta_ms);
 }
 
 #else
