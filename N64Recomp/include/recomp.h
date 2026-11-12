@@ -111,7 +111,10 @@ typedef uint64_t gpr;
     ((gpr)(int32_t)((a) - (b)))
 
 // 64-bit hosts reserve 4GB after rdram and keep only an address's low 32 bits, so any guest address, even a non-canonical register value, faults instead of hitting host memory; 32-bit hosts can't, so they wrap into the 512MB window.
-#if UINTPTR_MAX == 0xFFFFFFFFu
+// The browser build's window is 64MB (librecomp's mem_size) to fit mobile Safari's memory limits.
+#if defined(__EMSCRIPTEN__)
+#define RDRAM_OFFSET(addr) (((uint32_t)(addr) - 0x80000000u) & 0x03FFFFFFu)
+#elif UINTPTR_MAX == 0xFFFFFFFFu
 #define RDRAM_OFFSET(addr) (((uint32_t)(addr) - 0x80000000u) & 0x1FFFFFFFu)
 #else
 #define RDRAM_OFFSET(addr) ((uint32_t)(addr) - 0x80000000u)
@@ -372,17 +375,26 @@ static inline void set_cop1_cs(uint32_t val) {
 #define CVT_S_D(val) \
     ((float)(val))
 
+// Truncations give x86's cvttss2si result (INT32_MIN / INT64_MIN) for NaN and out-of-range input on every host; a plain cast traps in wasm and saturates on arm64.
+static inline int32_t do_trunc_w_d(double val) {
+    return (val > -2147483649.0 && val < 2147483648.0) ? (int32_t)val : INT32_MIN;
+}
+
+static inline int64_t do_trunc_l_d(double val) {
+    return (val >= -9223372036854775808.0 && val < 9223372036854775808.0) ? (int64_t)val : INT64_MIN;
+}
+
 #define TRUNC_W_S(val) \
-    ((int32_t)(val))
+    do_trunc_w_d((double)(val))
 
 #define TRUNC_W_D(val) \
-    ((int32_t)(val))
+    do_trunc_w_d(val)
 
 #define TRUNC_L_S(val) \
-    ((int64_t)(val))
+    do_trunc_l_d((double)(val))
 
 #define TRUNC_L_D(val) \
-    ((int64_t)(val))
+    do_trunc_l_d(val)
 
 #define DEFAULT_ROUNDING_MODE 0
 

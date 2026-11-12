@@ -89,6 +89,9 @@ bool get_to_vec(const nlohmann::json& val, std::vector<T2>& out) {
 // GCC/Clang 32-bit ARM, built in ARM mode (-marm) so function pointers are plain addresses
 #elif defined(__arm__) && !defined(__thumb__)
 #   define IS_ARM32
+// WebAssembly: compiled code is immutable, so functions can't be patched in place.
+#elif defined(__EMSCRIPTEN__)
+#   define IS_WASM
 #else
 #   error "Unsupported architecture!"
 #endif
@@ -288,8 +291,10 @@ void protect(void* target_func, uint64_t old_flags) {
     patch_pages(target_func, &page_start, &length);
     int result = mprotect((void*)page_start, length, PROT_READ | PROT_EXEC);
     (void)result;
-    // ARM's instruction cache doesn't see the patched bytes on its own; a no-op on x86.
+    // ARM's instruction cache doesn't see the patched bytes on its own; a no-op on x86. WebAssembly never patches code (patch_func).
+#if !defined(__EMSCRIPTEN__)
     __builtin___clear_cache((char*)target_func, (char*)target_func + sizeof(recomp::mods::PatchData::replaced_bytes));
+#endif
 }
 #endif
 
@@ -536,6 +541,13 @@ recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
     const N64Recomp::Context& context, const ModCodeHandleInputs& inputs,
     std::unordered_map<size_t, size_t>&& entry_func_hooks, std::unordered_map<size_t, size_t>&& return_func_hooks, std::vector<size_t>&& original_section_indices, bool regenerated)
 {
+#if defined(__EMSCRIPTEN__)
+    // No JIT in the browser: the handle stays not-good and the mod reports a load error.
+    (void)context;
+    (void)inputs;
+    (void)regenerated;
+    is_good = false;
+#else
     if (!regenerated) {
        section_addresses = std::make_unique<int32_t[]>(context.sections.size());
     }
@@ -577,8 +589,23 @@ recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
     // Generate the code.
     recompiler_output = std::make_unique<N64Recomp::LiveGeneratorOutput>(generator.finish());
     is_good = !errored && recompiler_output->good;
+#endif
 }
 
+#if defined(__EMSCRIPTEN__)
+// LiveRecomp isn't linked in the browser. Code mods never load there, so these stand-ins are never called; they only satisfy the linker.
+N64Recomp::LiveGeneratorOutput::~LiveGeneratorOutput() = default;
+
+N64Recomp::ShimFunction::ShimFunction(recomp_func_ext_t*, uintptr_t) : code(nullptr), func(nullptr) {
+}
+
+N64Recomp::ShimFunction::~ShimFunction() = default;
+
+void N64Recomp::live_recompiler_init() {
+}
+#endif
+
+#if !defined(__EMSCRIPTEN__)
 void recomp::mods::LiveRecompilerCodeHandle::set_imported_function(size_t import_index, GenericFunction func) {
     std::visit(overloaded {
         [this, import_index](recomp_func_t* native_func) {
@@ -610,8 +637,27 @@ recomp::mods::CodeModLoadError recomp::mods::LiveRecompilerCodeHandle::populate_
 recomp::mods::GenericFunction recomp::mods::LiveRecompilerCodeHandle::get_function_handle(size_t func_index) {
     return GenericFunction{ recompiler_output->functions[func_index] };
 }
+#else
+// The browser build never makes a good live handle (see the constructor), so mod loading stops before these are called.
+void recomp::mods::LiveRecompilerCodeHandle::set_imported_function(size_t, GenericFunction) {
+}
+
+recomp::mods::CodeModLoadError recomp::mods::LiveRecompilerCodeHandle::populate_reference_symbols(const N64Recomp::Context&, std::string&) {
+    return CodeModLoadError::Good;
+}
+
+recomp::mods::GenericFunction recomp::mods::LiveRecompilerCodeHandle::get_function_handle(size_t) {
+    return GenericFunction{ static_cast<recomp_func_t*>(nullptr) };
+}
+#endif
 
 void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replacement_func) {
+#if defined(IS_WASM)
+    (void)target_func;
+    (void)replacement_func;
+    fprintf(stderr, "[mods] function replacement is not available in the browser build\n");
+    return;
+#endif
     uint8_t* target_func_u8 = reinterpret_cast<uint8_t*>(target_func);
     size_t offset = 0;
 
@@ -651,6 +697,7 @@ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replac
            write_bytes(jmp_eax, sizeof(jmp_eax));
         }
     }, replacement_func);
+#elif defined(IS_WASM)
 #elif defined(IS_ARM32)
     // ldr pc, [pc, #-4] loads the word right after it (pc reads as this instruction + 8).
     static const uint8_t ldr_pc_next[] = {0x04, 0xF0, 0x1F, 0xE5};

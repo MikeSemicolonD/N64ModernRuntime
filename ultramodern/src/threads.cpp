@@ -173,6 +173,11 @@ void ultramodern::set_native_thread_name(const std::string& name) {
 }
 
 void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
+#elif defined(__EMSCRIPTEN__)
+// Browser workers have no settable name or priority.
+void ultramodern::set_native_thread_name(const std::string&) {}
+
+void ultramodern::set_native_thread_priority(ThreadPriority) {}
 #endif
 
 [[noreturn]] static void end_deleted_thread(UltraThreadContext* cur_context);

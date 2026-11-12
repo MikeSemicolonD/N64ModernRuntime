@@ -1,6 +1,6 @@
 #include "librecomp/fault_guard.hpp"
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 #include <atomic>
 #include <csetjmp>
 #include <csignal>
@@ -101,6 +101,14 @@ bool recomp::fault_guard::run(void (*fn)(void*), void* arg, Info* info) {
         return false;
     }
     pthread_setspecific(g_frame_key, &frame);
+    fn(arg);
+    return true;
+}
+#endif
+
+#if defined(__EMSCRIPTEN__)
+// WebAssembly has no SIGSEGV: a stray access inside linear memory just reads data, and a trap ends the program.
+bool recomp::fault_guard::run(void (*fn)(void*), void* arg, Info*) {
     fn(arg);
     return true;
 }

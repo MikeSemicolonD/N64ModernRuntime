@@ -64,5 +64,10 @@ endif()
 add_subdirectory(${PROJECT_SOURCE_DIR}/../thirdparty/miniz ${CMAKE_CURRENT_BINARY_DIR}/miniz)
 add_subdirectory(${PROJECT_SOURCE_DIR}/../N64Recomp ${CMAKE_CURRENT_BINARY_DIR}/N64Recomp EXCLUDE_FROM_ALL)
 
-target_link_libraries(librecomp PRIVATE ultramodern N64Recomp LiveRecomp)
+target_link_libraries(librecomp PRIVATE ultramodern N64Recomp)
+
+# sljit has no WebAssembly target, so the browser build can't recompile mods at load time.
+if (NOT EMSCRIPTEN)
+    target_link_libraries(librecomp PRIVATE LiveRecomp)
+endif()
 target_link_libraries(librecomp PUBLIC miniz)

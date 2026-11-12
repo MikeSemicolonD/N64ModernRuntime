@@ -6,8 +6,12 @@
 #include "recomp.h"
 
 namespace recomp {
-    // 512GB (kseg0 size)
+    // 512MB (kseg0 size); 64MB in the browser, matching RDRAM_OFFSET's mask there.
+#if defined(__EMSCRIPTEN__)
+    constexpr size_t mem_size = 64ULL * 1024ULL * 1024ULL;
+#else
     constexpr size_t mem_size = 512ULL * 1024ULL * 1024ULL;
+#endif
     // 4GB (the full address space) plus a guard for an access straddling its last byte; 32-bit hosts reserve only mem_size and mask guest addresses instead (RDRAM_OFFSET).
     constexpr size_t allocation_size = sizeof(void*) == 4 ? mem_size : (size_t)(4096ULL * 1024ULL * 1024ULL + 64ULL * 1024ULL);
     // We need a place in rdram to hold the PI handles, so pick an address in extended rdram
