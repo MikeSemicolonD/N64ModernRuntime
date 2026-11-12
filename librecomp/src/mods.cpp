@@ -10,6 +10,7 @@
 #include "librecomp/overlays.hpp"
 #include "librecomp/game.hpp"
 #include "librecomp/patcher.hpp"
+#include "librecomp/static_native_libs.hpp"
 #include "recompiler/context.h"
 #include "recompiler/live_recompiler.h"
 
@@ -355,6 +356,29 @@ void recomp::mods::ModHandle::populate_exports() {
 }
 
 recomp::mods::CodeModLoadError recomp::mods::ModHandle::load_native_library(const recomp::mods::NativeLibraryManifest& lib_manifest, std::string& error_param) {
+    // A library linked into the executable (the browser build) stands in for the file.
+    if (const StaticNativeLibrary* linked = find_static_native_library(lib_manifest.name)) {
+        std::string api_error_param;
+        CodeModLoadError api_error = validate_api_version(linked->api_version, api_error_param);
+
+        if (api_error != CodeModLoadError::Good) {
+            error_param = lib_manifest.name + (api_error_param.empty() ? "" : ":" + api_error_param);
+            return api_error;
+        }
+
+        native_library_exports.clear();
+        for (const std::string& export_name : lib_manifest.exports) {
+            auto found = linked->exports.find(export_name);
+            if (found == linked->exports.end()) {
+                error_param = lib_manifest.name + ":" + export_name;
+                return CodeModLoadError::FailedToFindNativeExport;
+            }
+            native_library_exports.emplace(export_name, found->second);
+        }
+
+        return CodeModLoadError::Good;
+    }
+
     std::string lib_filename = lib_manifest.name + std::string{DynamicLibrary::PlatformExtension};
     // mod_root_path is the mod folder for a folder mod, or the archive file for an
     // archive mod; the native library lives beside the manifest either way.
