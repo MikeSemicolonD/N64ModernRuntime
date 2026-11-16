@@ -528,6 +528,34 @@ void dp_complete() {
     ultramodern::enqueue_external_message_src(events_context.dp.mq, events_context.dp.msg, false, ultramodern::EventMessageSource::Dp);
 }
 
+// RogueSquadron64Recomp: parsing live RDRAM needs SP-done held until the parse ends, or the game recycles DL chunks the HLE is still walking.
+// The task-start snapshot makes the early SP-done safe, and the game's audio tasks then run during the parse. ROGUESQ_SP_COMPLETE_AFTER_PARSE=0/1 forces either.
+static bool sp_complete_after_parse() {
+    static const bool on = [](){ const char* e = std::getenv("ROGUESQ_SP_COMPLETE_AFTER_PARSE"); return (e && *e) ? (*e != '0') : !parse_snapshot_enabled(); }();
+    return on;
+}
+
+// Set while the gfx thread's current task has already signalled completion through rs64_gfx_complete_early.
+static thread_local bool t_gfx_completed_early = false;
+
+// RT64 calls this once the task's GPU work is submitted and nothing left reads or writes the game's RDRAM, so the game
+// builds its next frame during the GPU wait. Snapshot parses only; ROGUESQ_DP_COMPLETE_EARLY=0 disables.
+extern "C" void rs64_gfx_complete_early(void) {
+    static const bool on = [](){ const char* e = std::getenv("ROGUESQ_DP_COMPLETE_EARLY"); return parse_snapshot_enabled() && !(e && *e == '0'); }();
+
+    if (!on || t_gfx_completed_early) {
+        return;
+    }
+
+    t_gfx_completed_early = true;
+
+    if (sp_complete_after_parse()) {
+        sp_complete();
+    }
+
+    dp_complete();
+}
+
 // Counts async audio synth tasks that have been queued but not yet finished
 // writing their output. wait_for_pending_audio_synth() (called from
 // osAiSetNextBuffer) blocks until this drains, so the game never plays a
@@ -681,10 +709,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
                 // is finished as well, so sending this early shouldn't be an issue in most cases.
                 // If this causes issues then the logic can be replaced with responding to yield requests.
-                // RogueSquadron64Recomp (2026-09-07): ROGUESQ_SP_COMPLETE_AFTER_PARSE=1 delivers the SP-done
-                // event only after the list has been parsed, as the RSP would. With the early completion the
-                // game recycles DL chunks the HLE is still walking (phantom commands / garbage SETCIMG).
-                static const bool s_sp_after = [](){ const char* e = std::getenv("ROGUESQ_SP_COMPLETE_AFTER_PARSE"); return !(e && *e == '0'); }();   // default on
+                const bool s_sp_after = sp_complete_after_parse();
                 if (!s_sp_after) sp_complete();
                 ultramodern::measure_input_latency();
 
@@ -732,8 +757,11 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 }
                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
 
-                if (s_sp_after) sp_complete();
-                dp_complete();
+                if (!t_gfx_completed_early) {
+                    if (s_sp_after) sp_complete();
+                    dp_complete();
+                }
+                t_gfx_completed_early = false;
                 { std::lock_guard<std::mutex> plock{ g_gfx_parse_mutex }; if (g_gfx_parse_inflight.load(std::memory_order_acquire) > 0) g_gfx_parse_inflight.fetch_sub(1, std::memory_order_acq_rel); }
                 g_gfx_parse_cv.notify_all();
                 if (s_log_task) { fprintf(stderr, "[gfx-task #%u] done sp+dp signaled parse=%lld us pdl=%lld us hops=%u faces=%u req=%u inflight=%d\n", s_task_n, (long long)std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count(), g_rs64_pdl_us, g_f5_task_hops, g_f5_task_faces, g_rs64_gfx_requests, g_gfx_parse_inflight.load(std::memory_order_acquire)); fflush(stderr); }
