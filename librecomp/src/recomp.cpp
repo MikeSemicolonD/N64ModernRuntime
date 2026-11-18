@@ -497,9 +497,57 @@ extern "C" unsigned recomp_fault_caught_count(void) {
     return s_faults_caught.load(std::memory_order_relaxed);
 }
 
+#ifdef _WIN32
+// Code LiveRecomp generates for mod hooks registers no unwind info, so a fault there can't be dispatched to the __try in
+// run_thread_function and the process ends. This vectored handler resumes the thread at the context the guard saved instead,
+// which ends the thread as the __except does (and as the POSIX fault_guard's siglongjmp does).
+namespace {
+    struct UnwindlessGuard {
+        CONTEXT resume;
+        volatile LONG faulted;
+        DWORD code;
+        ULONG_PTR kind;
+        uintptr_t target;
+        uintptr_t pc;
+    };
+
+    thread_local UnwindlessGuard* t_unwindless_guard = nullptr;
+
+    LONG WINAPI unwindless_guard_handler(EXCEPTION_POINTERS* ep) {
+        UnwindlessGuard* guard = t_unwindless_guard;
+        const DWORD code = ep->ExceptionRecord->ExceptionCode;
+        if (guard == nullptr || code < 0xC0000000u || code == 0xE06D7363u) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        const DWORD64 pc = ep->ContextRecord->Rip;
+        DWORD64 image = 0;
+        HMODULE mod = nullptr;
+        if (RtlLookupFunctionEntry(pc, &image, nullptr) != nullptr ||
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)pc, &mod)) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        const bool has_info = ep->ExceptionRecord->NumberParameters >= 2;
+        guard->code = code;
+        guard->kind = has_info ? ep->ExceptionRecord->ExceptionInformation[0] : 0;
+        guard->target = has_info ? (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1] : 0;
+        guard->pc = (uintptr_t)pc;
+        guard->faulted = 1;
+        t_unwindless_guard = nullptr;
+        *ep->ContextRecord = guard->resume;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    void install_unwindless_guard() {
+        static std::once_flag once;
+        std::call_once(once, [] { AddVectoredExceptionHandler(1, unwindless_guard_handler); });
+    }
+}
+#endif
+
 void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t arg) {
-    auto find_it = game_roms.find(current_game.value());
-    const recomp::GameEntry& game_entry = find_it->second;
+    // No iterator outlives this line: after a caught fault skips destructors, a debug-build iterator left alive here walks the
+    // container's iterator chain past the abandoned frames' entries when it is destroyed, and faults.
+    const recomp::GameEntry& game_entry = game_roms.find(current_game.value())->second;
 
     recomp_context ctx{};
     ctx.r29 = sp;
@@ -525,6 +573,18 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
     ULONG_PTR av_kind = 0;  // 0=read, 1=write, 8=execute(DEP)
     void* av_frames[8] = {};
     USHORT av_frame_count = 0;
+    UnwindlessGuard guard{};
+    install_unwindless_guard();
+    RtlCaptureContext(&guard.resume);
+    if (guard.faulted != 0) {
+        s_faults_caught.fetch_add(1, std::memory_order_relaxed);
+        const char* kind_str = (guard.kind == 0) ? "READ" : (guard.kind == 1) ? "WRITE" : (guard.kind == 8) ? "EXEC" : "?";
+        fprintf(stderr, "[recomp] SEH caught: thread_entry=0x%08X code=0x%08X kind=%s av_target=0x%p av_pc=0x%p in runtime-recompiled code\n",
+                (uint32_t)addr, (unsigned)guard.code, kind_str, (void*)guard.target, (void*)guard.pc);
+        fflush(stderr);
+        return;
+    }
+    t_unwindless_guard = &guard;
     __try {
         invoke_recomp_func(func, rdram, &ctx);
     }
@@ -555,6 +615,7 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
         fprintf(stderr, "\n");
         fflush(stderr);
     }
+    t_unwindless_guard = nullptr;
 #else
     // POSIX counterpart of the SEH wrapper above: a guest fault ends this thread instead of the process.
     struct GuardedCall { recomp_func_t* func; uint8_t* rdram; recomp_context* ctx; } call{ func, rdram, &ctx };
