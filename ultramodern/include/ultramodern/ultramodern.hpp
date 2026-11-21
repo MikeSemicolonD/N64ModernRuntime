@@ -113,13 +113,17 @@ void set_main_thread();
 bool is_game_thread();
 void submit_rsp_task(RDRAM_ARG PTR(OSTask) task);
 void send_si_message();
-uint32_t get_speed_multiplier();
+// Game clock speed (1 = real time, 1/16..16); changing it never makes the game clock jump.
+double get_speed();
+void set_speed(double rate);
 void set_vi_rate(uint32_t hz);
 uint32_t get_vi_rate();
 
 // Time
 std::chrono::high_resolution_clock::time_point get_start();
 std::chrono::high_resolution_clock::duration time_since_start();
+std::chrono::microseconds game_time_since_start();
+std::chrono::high_resolution_clock::time_point game_time_to_real(std::chrono::microseconds game_time);
 void measure_input_latency();
 void sleep_milliseconds(uint32_t millis);
 void sleep_until(const std::chrono::high_resolution_clock::time_point& time_point);

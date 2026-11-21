@@ -410,8 +410,8 @@ void vi_thread_func() {
 
     while (!exited) {
         // Determine the next VI time (more accurate than adding 16ms each VI interrupt)
-        const uint32_t vi_rate = ultramodern::get_speed_multiplier() * ultramodern::get_vi_rate();
-        auto next = ultramodern::get_start() + (total_vis * 1000000us) / vi_rate;
+        const uint32_t vi_rate = ultramodern::get_vi_rate();
+        auto next = ultramodern::game_time_to_real((total_vis * 1000000us) / vi_rate);
         //if (next > std::chrono::high_resolution_clock::now()) {
         //    printf("Sleeping for %" PRIu64 " us to get from %" PRIu64 " us to %" PRIu64 " us \n",
         //        (next - std::chrono::high_resolution_clock::now()) / 1us,
@@ -426,7 +426,7 @@ void vi_thread_func() {
             next = std::chrono::high_resolution_clock::now();
         }
         ultramodern::sleep_until(next);
-        auto time_now = ultramodern::time_since_start();
+        auto time_now = ultramodern::game_time_since_start();
         // Calculate how many VIs have passed
         uint64_t new_total_vis = (time_now * vi_rate / 1000ms) + 1;
         if (new_total_vis > total_vis + 1) {

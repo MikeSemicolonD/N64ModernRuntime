@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 #include <variant>
 #include <set>
@@ -17,18 +19,37 @@
 static std::chrono::high_resolution_clock::time_point start_time = std::chrono::high_resolution_clock::now();
 // Offset of the duration since program start used to calculate the value for osGetTime. 
 static int64_t ostime_offset = 0;
-// Game speed multiplier (1 means no speedup). ROGUESQ_SPEED=<1..16> runs the VI clock and CPU counter faster, for replays under a fixed timestep.
-static uint32_t speed_multiplier() {
-    static const uint32_t s = []() {
-        const char* e = std::getenv("ROGUESQ_SPEED");
-        const int v = (e && e[0]) ? std::atoi(e) : 1;
-        return (uint32_t)(v < 1 ? 1 : (v > 16 ? 16 : v));
-    }();
-    return s;
+// N64 CPU counter ticks per millisecond of game time
+static constexpr uint64_t counter_per_ms = 46'875;
+
+static double clamp_speed(double rate) {
+    return std::clamp(rate, 1.0 / 16.0, 16.0);
 }
-// N64 CPU counter ticks per millisecond
-static uint32_t counter_per_ms() {
-    return 46'875 * speed_multiplier();
+
+// The game clock (VI and CPU counter) runs at `rate` times real time from (base_real, base_us); ROGUESQ_SPEED seeds the rate and set_speed rebases, so the clock never jumps.
+struct GameClock {
+    std::chrono::high_resolution_clock::time_point base_real;
+    double base_us;
+    double rate;
+};
+
+static GameClock make_game_clock() {
+    const char* e = std::getenv("ROGUESQ_SPEED");
+    const double v = (e && e[0]) ? std::atof(e) : 1.0;
+    return { start_time, 0.0, v > 0.0 ? clamp_speed(v) : 1.0 };
+}
+
+static std::mutex game_clock_mutex;
+static GameClock game_clock = make_game_clock();
+
+static double game_us_at(const GameClock& c, std::chrono::high_resolution_clock::time_point t) {
+    return c.base_us + std::chrono::duration<double, std::micro>(t - c.base_real).count() * c.rate;
+}
+
+// Read under the lock together with now(), so the clock stays monotonic across a rate change.
+static double game_us_now() {
+    std::lock_guard<std::mutex> lock(game_clock_mutex);
+    return game_us_at(game_clock, std::chrono::high_resolution_clock::now());
 }
 
 struct OSTimer {
@@ -48,33 +69,23 @@ struct RemoveTimerAction {
     PTR(OSTimer) timer;
 };
 
-using Action = std::variant<AddTimerAction, RemoveTimerAction>;
+// Wakes the timer thread to recompute its wait after a speed change.
+struct WakeAction {};
+
+using Action = std::variant<AddTimerAction, RemoveTimerAction, WakeAction>;
 
 struct {
     std::thread thread;
     moodycamel::BlockingConcurrentQueue<Action> action_queue{};
 } timer_context;
 
-uint64_t duration_to_ticks(std::chrono::high_resolution_clock::duration duration) {
-    uint64_t delta_micros = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-    // More accurate than using a floating point timer, will only overflow after running for 12.47 years
-    // Units: (micros * (counts/millis)) / (micros/millis) = counts
-    uint64_t total_count = (delta_micros * counter_per_ms()) / 1000;
-
-    return total_count;
-}
-
-std::chrono::microseconds ticks_to_duration(uint64_t ticks) {
-    using namespace std::chrono_literals;
-    return ticks * 1000us / counter_per_ms();
-}
-
 std::chrono::high_resolution_clock::time_point ticks_to_timepoint(uint64_t ticks) {
-    return start_time + ticks_to_duration(ticks);
+    return ultramodern::game_time_to_real(std::chrono::microseconds(ticks * 1000 / counter_per_ms));
 }
 
 uint64_t time_now() {
-    return duration_to_ticks(std::chrono::high_resolution_clock::now() - start_time);
+    // Units: (micros * (counts/millis)) / (micros/millis) = counts
+    return ((uint64_t)game_us_now() * counter_per_ms) / 1000;
 }
 
 void timer_thread(RDRAM_ARG1) {
@@ -156,8 +167,28 @@ void ultramodern::init_timers(RDRAM_ARG1) {
     timer_context.thread.detach();
 }
 
-uint32_t ultramodern::get_speed_multiplier() {
-    return speed_multiplier();
+double ultramodern::get_speed() {
+    std::lock_guard<std::mutex> lock(game_clock_mutex);
+    return game_clock.rate;
+}
+
+void ultramodern::set_speed(double rate) {
+    std::lock_guard<std::mutex> lock(game_clock_mutex);
+    const auto now = std::chrono::high_resolution_clock::now();
+    game_clock.base_us = game_us_at(game_clock, now);
+    game_clock.base_real = now;
+    game_clock.rate = clamp_speed(rate);
+    timer_context.action_queue.enqueue(WakeAction{});
+}
+
+std::chrono::microseconds ultramodern::game_time_since_start() {
+    return std::chrono::microseconds((int64_t)game_us_now());
+}
+
+std::chrono::high_resolution_clock::time_point ultramodern::game_time_to_real(std::chrono::microseconds game_time) {
+    std::lock_guard<std::mutex> lock(game_clock_mutex);
+    const std::chrono::duration<double, std::micro> real_us((game_time.count() - game_clock.base_us) / game_clock.rate);
+    return game_clock.base_real + std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(real_us);
 }
 
 std::chrono::high_resolution_clock::time_point ultramodern::get_start() {
