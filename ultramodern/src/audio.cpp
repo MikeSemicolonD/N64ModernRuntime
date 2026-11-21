@@ -16,7 +16,8 @@ std::mutex g_rs64_ai_mutex;
 std::deque<std::chrono::steady_clock::time_point> g_rs64_ai_deadlines;
 static std::chrono::steady_clock::time_point g_rs64_ai_playhead{};
 static void rs64_ai_schedule(uint32_t byte_count) {
-    const int64_t dur_us = (sample_rate > 0) ? (int64_t)byte_count * 1000000 / (4 * (int64_t)sample_rate) : 16667;
+    // Divided by the game speed so the audio thread (and the cutscenes waiting on it) keeps pace with the scaled game clock.
+    const int64_t dur_us = (int64_t)(((sample_rate > 0) ? (double)byte_count * 1000000.0 / (4.0 * sample_rate) : 16667.0) / ultramodern::get_speed());
     std::lock_guard<std::mutex> lk(g_rs64_ai_mutex);
     const auto now = std::chrono::steady_clock::now();
     // FREE-RUNNING consumption clock (2026-09-13). Hardware's AI DMA consumes at a FIXED rate regardless of
