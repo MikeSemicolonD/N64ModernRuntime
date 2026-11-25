@@ -178,6 +178,8 @@ extern "C" volatile int g_active_overlay;                 // 0=mission/gameplay,
 
 struct ScreenUpdateAction {
     ultramodern::renderer::ViRegs regs;
+    // The display vsync this VI fired on (0 when the timer fired it).
+    uint64_t vsync = 0;
 };
 
 struct UpdateConfigAction {
@@ -399,6 +401,63 @@ uint32_t ultramodern::get_vi_rate() {
     return g_vi_rate.load(std::memory_order_relaxed);
 }
 
+// Display vsyncs (Android's choreographer): count and smoothed period. A VI timer free-running against the display drifts
+// to the vsync deadline and some presents miss it, so a 30 fps image stays up 3 refreshes and the next 1.
+static std::mutex g_vsync_mutex;
+static std::condition_variable g_vsync_cv;
+static uint64_t g_vsync_count = 0;
+static std::atomic<int64_t> g_vsync_period_ns{ 0 };
+// The vsync of the VI whose screen update the renderer is handling now (0 off the vsync-driven VI).
+static std::atomic<uint64_t> g_screen_vsync{ 0 };
+
+extern "C" uint64_t rs64_vsync_count(void) {
+    return g_screen_vsync.load(std::memory_order_relaxed);
+}
+
+extern "C" void rs64_vsync_wait(uint64_t count) {
+    std::unique_lock lock{ g_vsync_mutex };
+    g_vsync_cv.wait_for(lock, std::chrono::milliseconds(40), [&] { return g_vsync_count >= count; });
+}
+
+void ultramodern::signal_display_vsync(int64_t frame_time_ns) {
+    static int64_t s_last = 0;
+
+    const int64_t d = frame_time_ns - s_last;
+    s_last = frame_time_ns;
+
+    if (d > 0 && d < 100'000'000) {
+        const int64_t p = g_vsync_period_ns.load(std::memory_order_relaxed);
+        g_vsync_period_ns.store(p > 0 ? p + (d - p) / 8 : d, std::memory_order_relaxed);
+    }
+
+    {
+        std::lock_guard lock{ g_vsync_mutex };
+        ++g_vsync_count;
+    }
+
+    g_vsync_cv.notify_all();
+}
+
+// A VI on the next vsync while the display refreshes at the VI's own 60 Hz and the game runs at 1x; false (use the timer) otherwise or when vsyncs stop.
+static bool wait_display_vsync(uint32_t vi_rate, uint64_t& seen) {
+    const int64_t p = g_vsync_period_ns.load(std::memory_order_relaxed);
+
+    if (vi_rate != 60 || ultramodern::get_speed() != 1.0 || p < 16'000'000 || p > 17'400'000) {
+        return false;
+    }
+
+    std::unique_lock lock{ g_vsync_mutex };
+
+    if (seen == 0) {
+        seen = g_vsync_count;
+    }
+
+    const bool got = g_vsync_cv.wait_for(lock, std::chrono::milliseconds(50), [&] { return g_vsync_count != seen; });
+
+    seen = g_vsync_count;
+    return got;
+}
+
 void vi_thread_func() {
     ultramodern::set_native_thread_name("VI Thread");
     // This thread should be prioritized over every other thread in the application, as it's what allows
@@ -407,32 +466,29 @@ void vi_thread_func() {
     using namespace std::chrono_literals;
 
     int remaining_retraces = 1;
+    uint64_t vsync_seen = 0;
 
     while (!exited) {
         // Determine the next VI time (more accurate than adding 16ms each VI interrupt)
         const uint32_t vi_rate = ultramodern::get_vi_rate();
-        auto next = ultramodern::game_time_to_real((total_vis * 1000000us) / vi_rate);
-        //if (next > std::chrono::high_resolution_clock::now()) {
-        //    printf("Sleeping for %" PRIu64 " us to get from %" PRIu64 " us to %" PRIu64 " us \n",
-        //        (next - std::chrono::high_resolution_clock::now()) / 1us,
-        //        (std::chrono::high_resolution_clock::now() - events_context.start) / 1us,
-        //        (next - events_context.start) / 1us);
-        //} else {
-        //    printf("No need to sleep\n");
-        //}
-        // Detect if there's more than a second to wait and wait a fixed amount instead for the next VI if so, as that usually means the system clock went back in time.
-        if (std::chrono::floor<std::chrono::seconds>(next - std::chrono::high_resolution_clock::now()) > 1s) {
-            // printf("Skipping the next VI wait\n");
-            next = std::chrono::high_resolution_clock::now();
+
+        const bool on_vsync = wait_display_vsync(vi_rate, vsync_seen);
+
+        if (on_vsync) {
+            total_vis = (ultramodern::game_time_since_start() * vi_rate / 1000ms) + 1;
         }
-        ultramodern::sleep_until(next);
-        auto time_now = ultramodern::game_time_since_start();
-        // Calculate how many VIs have passed
-        uint64_t new_total_vis = (time_now * vi_rate / 1000ms) + 1;
-        if (new_total_vis > total_vis + 1) {
-            //printf("Skipped % " PRId64 " frames in VI interupt thread!\n", new_total_vis - total_vis - 1);
+        else {
+            vsync_seen = 0;
+            auto next = ultramodern::game_time_to_real((total_vis * 1000000us) / vi_rate);
+            // Detect if there's more than a second to wait and wait a fixed amount instead for the next VI if so, as that usually means the system clock went back in time.
+            if (std::chrono::floor<std::chrono::seconds>(next - std::chrono::high_resolution_clock::now()) > 1s) {
+                next = std::chrono::high_resolution_clock::now();
+            }
+            ultramodern::sleep_until(next);
+            auto time_now = ultramodern::game_time_since_start();
+            // Calculate how many VIs have passed
+            total_vis = (time_now * vi_rate / 1000ms) + 1;
         }
-        total_vis = new_total_vis;
 
         // If the game hasn't started yet, set a dummy VI mode and origin.
         if (!ultramodern::is_game_started()) {
@@ -443,7 +499,7 @@ void vi_thread_func() {
 
         // Queue a screen update for the graphics thread with the current VI register state.
         // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
-        events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
+        events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs, on_vsync ? vsync_seen : 0 });
 
         // Update VI registers and swap VI modes.
         events_context.vi.update_vi();
@@ -772,6 +828,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
             }
             else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
                 events_context.vi.update_screen_regs = screen_update_action->regs;
+                g_screen_vsync.store(screen_update_action->vsync, std::memory_order_relaxed);
                 renderer_context->update_screen();
                 display_refresh_rate = renderer_context->get_display_framerate();
                 resolution_scale = renderer_context->get_resolution_scale();

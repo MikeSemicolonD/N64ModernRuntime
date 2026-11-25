@@ -131,6 +131,8 @@ void sleep_until(const std::chrono::high_resolution_clock::time_point& time_poin
 // Graphics
 uint32_t get_target_framerate(uint32_t original);
 uint32_t get_display_refresh_rate();
+// A display vsync at frame_time_ns. While they arrive at about 60 Hz and the VI runs at 60, each one is a VI, as the N64's VI was the display refresh.
+void signal_display_vsync(int64_t frame_time_ns);
 float get_resolution_scale();
 void trigger_config_action();
 
