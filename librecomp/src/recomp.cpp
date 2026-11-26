@@ -513,6 +513,7 @@ namespace {
 
     thread_local UnwindlessGuard* t_unwindless_guard = nullptr;
 
+#if defined(_M_X64)
     LONG WINAPI unwindless_guard_handler(EXCEPTION_POINTERS* ep) {
         UnwindlessGuard* guard = t_unwindless_guard;
         const DWORD code = ep->ExceptionRecord->ExceptionCode;
@@ -536,10 +537,14 @@ namespace {
         *ep->ContextRecord = guard->resume;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
+#endif
 
     void install_unwindless_guard() {
+        // x86 SEH is frame-based, so the __try below already catches faults in code without unwind info.
+#if defined(_M_X64)
         static std::once_flag once;
         std::call_once(once, [] { AddVectoredExceptionHandler(1, unwindless_guard_handler); });
+#endif
     }
 }
 #endif
